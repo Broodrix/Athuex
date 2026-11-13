@@ -1,17 +1,17 @@
 # Athuex APK — GitHub Actions (arm64-v8a, Galaxy A06)
-# Artifact: athuex-v2.11.1-debug.apk
+# Artifact: athuex-v<version-from-gradle>-debug.apk  (version auto-detected each run)
 #
 # History:
 # - v2.9.3: setup-android@v3 failed on obsolete `tools` package → fixed with @v4
 # - v2.11.0: llama.h missing because third_party/llama.cpp is gitignored → shallow-clone in CI
-# - v2.11.1: fixed LLAMA_GIT_URL to point at the full llama.cpp repository URL
-#            and allow workflow runs from both main and master.
+# - v2.11.1: full LLAMA_GIT_URL; consolidate on `main`; auto-detect versionName
+#            from android/app/build.gradle(.kts); more robust APK locator.
 
 name: build-apk
 
 on:
   push:
-    branches: [ main, master ]
+    branches: [ main ]
     paths:
       - 'android/**'
       - 'native/**'
@@ -21,11 +21,9 @@ on:
   workflow_dispatch:
 
 env:
-  ATHUEX_VERSION: "2.11.1"
   JAVA_VERSION: "17"
   NDK_VERSION: "26.3.11579264"
   # Pin a known llama.cpp ref for reproducible CI (update docs/LLAMA_CPP_COMMIT.txt when changing).
-  # For maximum reproducibility, replace "master" with a commit SHA or stable tag.
   LLAMA_GIT_URL: "https://github.com/ggml-org/llama.cpp.git"
   LLAMA_GIT_REF: "master"
 
@@ -41,6 +39,34 @@ jobs:
         with:
           submodules: recursive
           fetch-depth: 1
+
+      - name: Detect project version (from android/app/build.gradle)
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          GRADLE_FILE=""
+          for f in android/app/build.gradle.kts android/app/build.gradle; do
+            if [ -f "$f" ]; then GRADLE_FILE="$f"; break; fi
+          done
+          if [ -z "${GRADLE_FILE}" ]; then
+            echo "::error::Neither android/app/build.gradle.kts nor android/app/build.gradle was found"
+            exit 1
+          fi
+          echo "Reading version from ${GRADLE_FILE}"
+          # Match: versionName "1.2.3"   OR   versionName = "1.2.3"
+          VERSION="$(grep -oE 'versionName[[:space:]]*[=]?[[:space:]]*"[^"]+"' "${GRADLE_FILE}" \
+                     | head -1 | grep -oE '"[^"]+"' | head -1 | tr -d '"' || true)"
+          if [ -z "${VERSION}" ]; then
+            echo "::error::Could not detect a literal versionName in ${GRADLE_FILE}"
+            echo "---- lines containing 'version' ----"
+            grep -n 'version' "${GRADLE_FILE}" || true
+            echo "Hint: keep versionName as a string literal, e.g. versionName \"2.11.1\""
+            exit 1
+          fi
+          echo "Detected ATHUEX_VERSION=${VERSION}"
+          echo "ATHUEX_VERSION=${VERSION}" >> "$GITHUB_ENV"
+          echo "version=${VERSION}"       >> "$GITHUB_OUTPUT"
 
       - name: Set up JDK ${{ env.JAVA_VERSION }}
         uses: actions/setup-java@v4
@@ -96,7 +122,7 @@ jobs:
           set -euo pipefail
           if [ ! -f gradlew ]; then
             curl -fsSL -o /tmp/gradle-8.7-bin.zip \
-              https://gradle.org
+              https://services.gradle.org/distributions/gradle-8.7-bin.zip
             unzip -q /tmp/gradle-8.7-bin.zip -d /tmp
             /tmp/gradle-8.7/bin/gradle wrapper --gradle-version 8.7
           fi
@@ -113,11 +139,30 @@ jobs:
             -Dorg.gradle.jvmargs="-Xmx4g -XX:MaxMetaspaceSize=512m"
 
       - name: Locate and stage APK
+        shell: bash
         run: |
           set -euo pipefail
-          APK=$(find android -path '*/outputs/apk/*' -name '*.apk' -type f | head -1)
-          if [ -z "${APK}" ]; then
-            echo "No APK under android/**/outputs/apk"
+          APK=""
+          # 1) Explicit canonical names first
+          for candidate in \
+            "android/app/build/outputs/apk/debug/app-arm64-v8a-debug.apk" \
+            "android/app/build/outputs/apk/debug/app-debug.apk"; do
+            if [ -f "$candidate" ]; then APK="$candidate"; break; fi
+          done
+          # 2) ABI-split arm64-v8a
+          if [ -z "$APK" ]; then
+            APK=$(find android -path '*/outputs/apk/debug/*' -name '*arm64*-debug.apk' -type f 2>/dev/null | head -1 || true)
+          fi
+          # 3) Any debug APK
+          if [ -z "$APK" ]; then
+            APK=$(find android -path '*/outputs/apk/debug/*' -name '*.apk' -type f 2>/dev/null | head -1 || true)
+          fi
+          # 4) Anywhere
+          if [ -z "$APK" ]; then
+            APK=$(find android -path '*/outputs/apk/*' -name '*.apk' -type f 2>/dev/null | head -1 || true)
+          fi
+          if [ -z "$APK" ]; then
+            echo "::error::No APK found under android/**/outputs/apk"
             find android -name '*.apk' -type f || true
             find android -name 'libathuex*' -type f || true
             exit 1
@@ -125,12 +170,13 @@ jobs:
           echo "Found: ${APK}"
           ls -lh "${APK}"
           cp "${APK}" "athuex-v${ATHUEX_VERSION}-debug.apk"
+          ls -lh "athuex-v${ATHUEX_VERSION}-debug.apk"
 
       - name: Upload APK artifact
         uses: actions/upload-artifact@v4
         with:
-          name: athuex-v${{ env.ATHUEX_VERSION }}-debug-apk
-          path: athuex-v${{ env.ATHUEX_VERSION }}-debug.apk
+          name: athuex-v${{ steps.version.outputs.version }}-debug-apk
+          path: athuex-v${{ steps.version.outputs.version }}-debug.apk
           if-no-files-found: error
           retention-days: 30
 
@@ -141,3 +187,4 @@ jobs:
           echo "- ABI: arm64-v8a" >> "$GITHUB_STEP_SUMMARY"
           echo "- NDK: ${NDK_VERSION}" >> "$GITHUB_STEP_SUMMARY"
           echo "- llama.cpp: shallow clone of \`${LLAMA_GIT_REF}\` in CI (not in git)" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Version source: \`android/app/build.gradle[.kts]\` → \`versionName\`" >> "$GITHUB_STEP_SUMMARY"
