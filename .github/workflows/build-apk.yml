@@ -4,12 +4,14 @@
 # History:
 # - v2.9.3: setup-android@v3 failed on obsolete `tools` package → fixed with @v4
 # - v2.11.0: llama.h missing because third_party/llama.cpp is gitignored → shallow-clone in CI
+# - v2.11.1: fixed LLAMA_GIT_URL to point at the full llama.cpp repository URL
+#            and allow workflow runs from both main and master.
 
 name: build-apk
 
 on:
   push:
-    branches: [ main ]
+    branches: [ main, master ]
     paths:
       - 'android/**'
       - 'native/**'
@@ -23,7 +25,8 @@ env:
   JAVA_VERSION: "17"
   NDK_VERSION: "26.3.11579264"
   # Pin a known llama.cpp ref for reproducible CI (update docs/LLAMA_CPP_COMMIT.txt when changing).
-  LLAMA_GIT_URL: "https://github.com"
+  # For maximum reproducibility, replace "master" with a commit SHA or stable tag.
+  LLAMA_GIT_URL: "https://github.com/ggml-org/llama.cpp.git"
   LLAMA_GIT_REF: "master"
 
 jobs:
