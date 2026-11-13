@@ -1,0 +1,7 @@
+PROTO="https"
+HOST="github.com"
+REPO="Broodrix/Athuex.git"
+
+sed -i "s|AUTH_REPO_URL=.*|AUTH_REPO_URL=\"${PROTO}://x-access-token:\${GH_TOKEN}@${HOST}/${REPO}\"|" build_athuex.sh
+sed -i "s|git remote add origin.*|git remote add origin \"${PROTO}://${HOST}/${REPO}\"|" build_athuex.sh
+bash build_athuex.sh

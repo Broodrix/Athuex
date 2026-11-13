@@ -1,0 +1,140 @@
+# Athuex APK — GitHub Actions (arm64-v8a, Galaxy A06)
+# Artifact: athuex-v2.11.1-debug.apk
+#
+# History:
+# - v2.9.3: setup-android@v3 failed on obsolete `tools` package → fixed with @v4
+# - v2.11.0: llama.h missing because third_party/llama.cpp is gitignored → shallow-clone in CI
+
+name: build-apk
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - 'android/**'
+      - 'native/**'
+      - 'core/**'
+      - 'third_party/imgui/**'
+      - '.github/workflows/build-apk.yml'
+  workflow_dispatch:
+
+env:
+  ATHUEX_VERSION: "2.11.1"
+  JAVA_VERSION: "17"
+  NDK_VERSION: "26.3.11579264"
+  # Pin a known llama.cpp ref for reproducible CI (update docs/LLAMA_CPP_COMMIT.txt when changing).
+  LLAMA_GIT_URL: "https://github.com"
+  LLAMA_GIT_REF: "master"
+
+jobs:
+  build:
+    name: Build Athuex APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Set up JDK ${{ env.JAVA_VERSION }}
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ env.JAVA_VERSION }}
+          cache: gradle
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v4
+        with:
+          packages: platform-tools platforms;android-34 build-tools;34.0.0
+          log-accepted-android-sdk-licenses: true
+
+      - name: Install NDK + CMake
+        shell: bash
+        run: |
+          set -euo pipefail
+          export ANDROID_HOME="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-}}"
+          echo "ANDROID_HOME=${ANDROID_HOME}"
+          SDKMANAGER="$(find "${ANDROID_HOME}/cmdline-tools" -name sdkmanager -type f 2>/dev/null | sort | tail -1 || true)"
+          if [ -z "${SDKMANAGER}" ]; then
+            SDKMANAGER="$(command -v sdkmanager || true)"
+          fi
+          test -n "${SDKMANAGER}" && test -x "${SDKMANAGER}"
+          echo "sdkmanager=${SDKMANAGER}"
+          yes | "${SDKMANAGER}" --licenses >/dev/null 2>&1 || true
+          "${SDKMANAGER}" --install "ndk;${NDK_VERSION}" "cmake;3.22.1"
+          echo "ANDROID_NDK_HOME=${ANDROID_HOME}/ndk/${NDK_VERSION}" >> "$GITHUB_ENV"
+          echo "ANDROID_HOME=${ANDROID_HOME}" >> "$GITHUB_ENV"
+          test -d "${ANDROID_HOME}/ndk/${NDK_VERSION}"
+
+      - name: Fetch llama.cpp (required — not vendored; gitignored)
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -f third_party/llama.cpp/include/llama.h ]; then
+            echo "llama.cpp already present"
+            ls third_party/llama.cpp/include/llama.h
+            exit 0
+          fi
+          echo "Cloning ${LLAMA_GIT_URL} @ ${LLAMA_GIT_REF} → third_party/llama.cpp"
+          rm -rf third_party/llama.cpp
+          git clone --depth 1 --branch "${LLAMA_GIT_REF}" "${LLAMA_GIT_URL}" third_party/llama.cpp
+          test -f third_party/llama.cpp/include/llama.h
+          test -f third_party/llama.cpp/CMakeLists.txt
+          echo "llama.cpp ready:"
+          (cd third_party/llama.cpp && git rev-parse HEAD && ls include/llama.h CMakeLists.txt)
+
+      - name: Ensure Gradle wrapper
+        working-directory: android
+        run: |
+          set -euo pipefail
+          if [ ! -f gradlew ]; then
+            curl -fsSL -o /tmp/gradle-8.7-bin.zip \
+              https://gradle.org
+            unzip -q /tmp/gradle-8.7-bin.zip -d /tmp
+            /tmp/gradle-8.7/bin/gradle wrapper --gradle-version 8.7
+          fi
+          chmod +x gradlew
+          ./gradlew --version
+
+      - name: Build debug APK (arm64-v8a)
+        working-directory: android
+        env:
+          ANDROID_NDK_HOME: ${{ env.ANDROID_NDK_HOME }}
+        run: |
+          set -euo pipefail
+          ./gradlew :app:assembleDebug --stacktrace --no-daemon \
+            -Dorg.gradle.jvmargs="-Xmx4g -XX:MaxMetaspaceSize=512m"
+
+      - name: Locate and stage APK
+        run: |
+          set -euo pipefail
+          APK=$(find android -path '*/outputs/apk/*' -name '*.apk' -type f | head -1)
+          if [ -z "${APK}" ]; then
+            echo "No APK under android/**/outputs/apk"
+            find android -name '*.apk' -type f || true
+            find android -name 'libathuex*' -type f || true
+            exit 1
+          fi
+          echo "Found: ${APK}"
+          ls -lh "${APK}"
+          cp "${APK}" "athuex-v${ATHUEX_VERSION}-debug.apk"
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: athuex-v${{ env.ATHUEX_VERSION }}-debug-apk
+          path: athuex-v${{ env.ATHUEX_VERSION }}-debug.apk
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Summary
+        run: |
+          echo "### Athuex v${ATHUEX_VERSION}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Artifact: \`athuex-v${ATHUEX_VERSION}-debug.apk\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- ABI: arm64-v8a" >> "$GITHUB_STEP_SUMMARY"
+          echo "- NDK: ${NDK_VERSION}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- llama.cpp: shallow clone of \`${LLAMA_GIT_REF}\` in CI (not in git)" >> "$GITHUB_STEP_SUMMARY"

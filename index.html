@@ -1,0 +1,550 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <base href="./">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,maximum-scale=1">
+  <meta name="theme-color" content="#0d1117">
+  <meta name="color-scheme" content="dark">
+  <meta name="description" content="Athuex — mobile AI workspace with .ssf volumes.">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="Athuex">
+  <title>Athuex — Mobile AI Workspace</title>
+  <link rel="manifest" href="manifest.webmanifest">
+  <link rel="icon" href="icon.png" type="image/png">
+  <link rel="apple-touch-icon" href="icon.png">
+  <link rel="stylesheet" href="css/ide.css">
+  <!-- Critical chatbar fallback for content:// / file:// WebViews where CSS may lag -->
+  <style id="athuex-critical">
+    html,body{width:100%;height:100%;margin:0;background:#0d1117;color:#e6edf3;font-family:system-ui,-apple-system,sans-serif;overflow:hidden}
+    .app-shell{height:100vh;height:100dvh;display:flex;flex-direction:column;min-height:0}
+    .toolbar{flex:0 0 auto;display:flex;align-items:center;gap:8px;padding:8px 12px;background:#161b22;border-bottom:1px solid #30363d}
+    .chips{flex:0 0 auto;display:flex;gap:6px;overflow-x:auto;padding:6px 8px;background:#010409;border-bottom:1px solid #30363d}
+    .workspace{flex:1;min-height:0;overflow:hidden;position:relative}
+    .swipe-viewport{height:100%;display:flex}
+    .panel{height:100%;min-width:0;display:flex;flex-direction:column;overflow:hidden;background:#0d1117}
+    .panel-header{flex:0 0 auto}
+    .chat-box{flex:1;min-height:0;overflow-y:auto}
+    .chat-controls{flex:0 0 auto;padding:8px 10px;background:#161b22;border-top:1px solid #30363d}
+    #chat-file-input,.file-input-hidden{position:absolute!important;width:1px!important;height:1px!important;opacity:0!important;pointer-events:none!important;clip:rect(0,0,0,0)!important;overflow:hidden!important;border:0!important;margin:-1px!important}
+    .athuex-chatbar-container{width:100%;box-sizing:border-box;background:rgba(18,18,18,.85);border:1px solid rgba(118,185,0,.25);border-radius:24px;padding:10px 14px;display:flex;flex-direction:column;gap:10px}
+    .controls-row{display:flex;justify-content:space-between;align-items:center;gap:8px}
+    .left-controls,.right-controls{display:flex;align-items:center;gap:8px}
+    .submit-mode-btn{width:0;opacity:0;overflow:hidden;pointer-events:none;border:none;background:#76b900;color:#000;border-radius:50%}
+    .submit-mode-btn.visible{width:36px!important;height:36px!important;opacity:1!important;pointer-events:auto!important;margin-left:8px!important}
+    .stop-mode-btn.hidden{display:none!important}
+    .athuex-menu{position:absolute;bottom:calc(100% + 10px);left:0;z-index:50;min-width:220px;padding:6px;background:#0e100cf2;border:1px solid rgba(118,185,0,.25);border-radius:16px;opacity:0;visibility:hidden;pointer-events:none}
+    .athuex-menu.open{opacity:1;visibility:visible;pointer-events:auto}
+    .menu-check,.menu-item svg{width:14px!important;height:14px!important;max-width:14px!important;max-height:14px!important}
+    .menu-item{-webkit-appearance:none;appearance:none;max-width:100%;box-sizing:border-box;display:flex;align-items:center;gap:10px;width:100%;padding:8px 10px;background:transparent;color:#f0f0f0;border:1px solid transparent;border-radius:11px;font:inherit;text-align:left}
+    .selector-wrap{position:relative;display:inline-flex}
+    .msg img,.md img{max-width:100%;height:auto;border-radius:10px;display:block;margin:8px 0}
+    .files-actions{display:flex;flex-wrap:wrap;gap:6px}
+  </style>
+</head>
+<body>
+  <svg width="0" height="0" aria-hidden="true" style="position:absolute">
+    <defs>
+      <linearGradient id="gFolder" x1="0" y1="0" x2="0" y2="1">
+        <stop offset="0" stop-color="#a8e63a"/><stop offset="1" stop-color="#4a7a00"/>
+      </linearGradient>
+      <linearGradient id="gFile" x1="0" y1="0" x2="0" y2="1">
+        <stop offset="0" stop-color="#9dabbd"/><stop offset="1" stop-color="#67748a"/>
+      </linearGradient>
+    </defs>
+  </svg>
+
+  <div id="drawer-overlay" class="drawer-overlay" aria-hidden="true"></div>
+  <aside id="chat-drawer" class="chat-drawer" role="navigation" aria-label="Chats" aria-hidden="true">
+    <div class="drawer-head">
+      <h2>Chats</h2>
+      <button id="close-drawer" class="icon-btn ghost" type="button" aria-label="Close">✕</button>
+    </div>
+    <button id="new-chat-btn" class="btn-primary drawer-new" type="button">+ New chat</button>
+    <div id="chat-list" class="chat-list" role="list"></div>
+  </aside>
+
+  <div class="app-shell" id="app">
+    <header class="toolbar" role="banner">
+      <button id="menu-toggle" class="icon-btn" type="button" aria-label="Chat menu">☰</button>
+      <a class="brand" href="#" id="brand-link" aria-label="Athuex">
+        <img src="icon.png" alt="" class="brand-icon" width="28" height="28">
+        <span class="brand-name" id="chat-title">Athuex</span>
+      </a>
+      <div class="toolbar-actions">
+        <span id="rpm-badge" class="badge rpm-badge success" role="status">0/40 RPM</span>
+        <span id="ctx-meter" class="ctx-meter">~0 tok</span>
+        <span id="status-text" class="status" role="status" aria-live="polite">Ready</span>
+        <button id="btn-settings" class="icon-btn" type="button" aria-label="Settings">⚙</button>
+      </div>
+    </header>
+
+    <!-- Dolphin-style quick places: Home=Chat, Desktop=Files, Documents=Editor, Root=Browser, Downloads=About, + -->
+    <nav class="chips" id="quickbar" aria-label="Programs">
+      <!-- chips rendered by programs registry -->
+      <button type="button" class="chip chip-add" id="chip-add" aria-label="Manage programs">
+        <svg class="chip-ico" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>
+      </button>
+    </nav>
+
+    <main class="workspace" role="main">
+      <div class="swipe-viewport view-edit" id="viewport">
+
+        <section class="panel panel-chat" id="panel-chat" role="tabpanel">
+          <div class="panel-header">
+            <strong>Athuex AI</strong>
+            <span class="muted" id="chat-model-label">Bolt</span>
+          </div>
+          <div class="chat-box" id="chat-box" role="log" aria-live="polite"></div>
+          <div id="undo-bar" class="undo-bar hidden" role="status">
+            <span id="undo-bar-label">AI edited files</span>
+            <div class="undo-bar-actions">
+              <button type="button" id="btn-undo-ai">Undo last</button>
+              <button type="button" id="btn-dismiss-undo" class="ghost" aria-label="Dismiss">✕</button>
+            </div>
+          </div>
+          <div class="chat-controls">
+            <div class="athuex-chatbar-container" id="chat-composer">
+              <div class="input-row">
+                <label for="user-input" class="sr-only">Ask Anything</label>
+                <textarea id="user-input" class="chat-textarea" placeholder="Ask Anything..." rows="1" enterkeyhint="enter" aria-label="Message"></textarea>
+              </div>
+              <div class="file-chips" id="fileChips" hidden></div>
+              <div class="controls-row">
+                <div class="left-controls">
+                  <button class="icon-only-btn" type="button" id="btn-chat-upload" aria-label="Attach files">
+                    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"></path></svg>
+                  </button>
+                  <input type="file" id="chat-file-input" class="file-input-hidden" multiple tabindex="-1" aria-hidden="true">
+                  <div class="selector-wrap" id="searchModeWrap">
+                    <button type="button" class="athuex-pill selector-pill" id="btn-ai-mode" aria-haspopup="listbox" aria-expanded="false" aria-label="AI route" title="AI route">
+                      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                        <circle cx="12" cy="12" r="10"></circle>
+                        <line x1="22" y1="12" x2="18" y2="12"></line>
+                        <line x1="6" y1="12" x2="2" y2="12"></line>
+                        <line x1="12" y1="6" x2="12" y2="2"></line>
+                        <line x1="12" y1="22" x2="12" y2="18"></line>
+                      </svg>
+                      <span class="pill-code" id="ai-mode-label">EXT</span>
+                      <svg class="chev" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="6 9 12 15 18 9"></polyline></svg>
+                    </button>
+                    <div class="athuex-menu" id="ai-mode-menu" role="listbox" aria-label="AI route" tabindex="-1">
+                      <div class="menu-header">AI Route</div>
+                      <button type="button" class="menu-item" role="option" data-mode="local" data-value="INT" data-desc="Local Q4_K_M" aria-selected="false">
+                        <span class="menu-code">INT</span>
+                        <span class="menu-desc">Local Q4_K_M</span>
+                        <svg class="menu-check" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="20 6 9 17 4 12"></polyline></svg>
+                      </button>
+                      <button type="button" class="menu-item selected" role="option" data-mode="cloud" data-value="EXT" data-desc="External only" aria-selected="true">
+                        <span class="menu-code">EXT</span>
+                        <span class="menu-desc">External only</span>
+                        <svg class="menu-check" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="20 6 9 17 4 12"></polyline></svg>
+                      </button>
+                      <button type="button" class="menu-item" role="option" data-mode="auto" data-value="HYB" data-desc="Hybrid — both" aria-selected="false">
+                        <span class="menu-code">HYB</span>
+                        <span class="menu-desc">Hybrid — both</span>
+                        <svg class="menu-check" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="20 6 9 17 4 12"></polyline></svg>
+                      </button>
+                    </div>
+                  </div>
+                  <button type="button" class="athuex-pill" id="thinkToggle" aria-pressed="false">
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 22c5.523 0 10-4.477 10-10S17.523 2 12 2 2 6.477 2 12s4.477 10 10 10z"></path><path d="M12 6v6l4 2"></path></svg>
+                    <span>Think</span>
+                  </button>
+                </div>
+                <div class="right-controls">
+                  <div class="dynamic-action-wrapper">
+                    <button id="btn-voice" class="action-btn voice-mode-btn" type="button" aria-label="Hold to talk" aria-pressed="false">
+                      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z"></path><path d="M19 10v1a7 7 0 0 1-14 0v-1"></path><line x1="12" x2="12" y1="19" y2="22"></line></svg>
+                    </button>
+                    <button id="btn-send" class="action-btn submit-mode-btn" type="button" aria-label="Send prompt" disabled>
+                      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><line x1="22" y1="2" x2="11" y2="13"></line><polygon points="22 2 15 22 11 13 2 9 22 2"></polygon></svg>
+                    </button>
+                    <button id="btn-stop" class="action-btn stop-mode-btn hidden" type="button" aria-label="Stop">
+                      <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><rect x="6" y="6" width="12" height="12" rx="2"></rect></svg>
+                    </button>
+                  </div>
+                </div>
+              </div>
+            </div>
+            <div id="chat-live-region" class="sr-only" aria-live="polite" aria-atomic="true"></div>
+          </div>
+        </section>
+
+        <section class="panel panel-files" id="panel-files" role="tabpanel">
+          <div class="files-source-bar">
+            <label class="files-source-label" for="files-source">Memory</label>
+            <select id="files-source" class="files-source-select" aria-label="Memory source">
+              <option value="workspace">Workspace (main)</option>
+              <option value="smfs">SMFS (external)</option>
+            </select>
+          </div>
+          <div class="files-topbar">
+            <button type="button" class="ico-btn" id="btn-files-back" aria-label="Back">
+              <svg viewBox="0 0 24 24" width="18" height="18"><path d="M15 5l-7 7 7 7" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
+            </button>
+            <button type="button" class="ico-btn" id="btn-files-up" aria-label="Up">
+              <svg viewBox="0 0 24 24" width="18" height="18"><path d="M12 19V6M6 11.5l6-6 6 6" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
+            </button>
+            <nav class="crumbs" id="files-crumbs" aria-label="Path"></nav>
+            <button type="button" class="text-btn" id="btn-new-file">+ New</button>
+            <button type="button" class="text-btn" id="btn-template">Template</button>
+          </div>
+          <div class="file-grid" id="file-grid" role="list"></div>
+          <div class="files-actions">
+            <button type="button" id="btn-export-ssf">Export .ssf</button>
+            <button type="button" id="btn-export-zip" title="Download workspace as ZIP">Export ZIP</button>
+            <button type="button" id="btn-import-ssf">Import .ssf</button>
+            <button type="button" id="btn-sync-to-smfs" title="Copy workspace → SMFS">Main → Ext</button>
+            <button type="button" id="btn-sync-from-smfs" title="Copy SMFS → workspace">Ext → Main</button>
+            <button type="button" id="btn-export-chat">Chat MD</button>
+            <button type="button" id="btn-idb-view" title="Browse IndexedDB">IndexedDB</button>
+            <button type="button" id="btn-gh-push">GH Push</button>
+            <input type="file" id="ssf-input" class="hidden" accept="*/*" data-accept-hint=".ssf,.zip">
+          </div>
+          <div class="files-footer">
+            <span id="files-status"><b>0</b> items · main</span>
+            <button type="button" id="btn-reset" class="text-btn danger-text">Reset</button>
+          </div>
+        </section>
+
+        <section class="panel panel-edit" id="panel-edit" role="tabpanel">
+          <div class="panel-header">
+            <span id="active-file-label">WELCOME.md</span>
+            <span class="muted" id="file-meta">Plain text</span>
+            <input type="search" id="find-input" class="find-input" placeholder="Find…" aria-label="Find">
+            <button type="button" id="btn-save" class="text-btn">Save</button>
+          </div>
+          <div class="editor-wrap">
+            <pre id="line-numbers" class="line-numbers" aria-hidden="true">1</pre>
+            <textarea id="code-editor" class="code-editor" spellcheck="false" autocomplete="off" autocorrect="off" autocapitalize="off" aria-label="Code editor"></textarea>
+          </div>
+          <div class="editor-footer">
+            <span id="line-count">1 line · 0 chars</span>
+            <span id="save-indicator">SMFS</span>
+          </div>
+        </section>
+
+        <section class="panel panel-preview" id="panel-preview" role="tabpanel">
+          <div class="browser-chrome">
+            <div class="browser-tabs" id="browser-tabs" role="tablist">
+              <button type="button" class="browser-tab active" data-tab="preview" id="btab-preview">Live</button>
+              <button type="button" class="browser-tab" data-tab="console" id="btab-console">Console</button>
+              <button type="button" class="browser-tab" data-tab="about-pane" id="btab-info">Info</button>
+              <button type="button" class="browser-tab-add" id="btn-browser-tab-add" aria-label="New tab">+</button>
+            </div>
+            <div class="browser-toolbar">
+              <button type="button" class="ico-btn" id="btn-back-edit" aria-label="Editor" title="Editor">←</button>
+              <button type="button" class="text-btn" id="btn-refresh">Refresh ↻</button>
+              <button type="button" class="text-btn" id="btn-console-copy">Copy log</button>
+              <button type="button" class="text-btn" id="btn-console-clear">Clear log</button>
+            </div>
+          </div>
+          <div class="browser-body">
+            <div class="browser-pane active" id="pane-preview">
+              <iframe id="preview-frame" title="Sandboxed live preview" sandbox="allow-scripts" referrerpolicy="no-referrer"></iframe>
+            </div>
+            <div class="browser-pane hidden" id="pane-console">
+              <div id="preview-console" class="preview-console browser-console" aria-label="Preview console"></div>
+            </div>
+            <div class="browser-pane hidden" id="pane-about-pane">
+              <div class="about-inline">
+                <p><strong>Live</strong> always shows the file open in the IDE (HTML/SVG live, other files as readable text).</p>
+                <p>Console captures <code>console.*</code> and runtime errors via postMessage.</p>
+                <p>Ask the AI to call <code>read_preview_console</code> after Refresh to debug.</p>
+              </div>
+            </div>
+          </div>
+          <div class="preview-footer">
+            <span>Sandboxed browser</span>
+            <span id="preview-status">Ready</span>
+          </div>
+        </section>
+
+        <section class="panel panel-browser" id="panel-browser" role="tabpanel">
+          <div class="browser-nav">
+            <button type="button" class="ico-btn" id="btn-browser-back" aria-label="Back">←</button>
+            <button type="button" class="ico-btn" id="btn-browser-fwd" aria-label="Forward">→</button>
+            <button type="button" class="ico-btn" id="btn-browser-reload" aria-label="Reload">↻</button>
+            <input type="url" class="browser-url" id="browser-url" placeholder="https://…" inputmode="url" enterkeyhint="go" autocomplete="off" spellcheck="false">
+            <button type="button" class="btn-primary" id="btn-browser-go">Go</button>
+          </div>
+          <div class="browser-frame-wrap">
+            <iframe id="browser-frame" title="Web browser" sandbox="allow-scripts allow-same-origin allow-forms allow-popups" referrerpolicy="no-referrer"></iframe>
+          </div>
+          <div class="browser-hint">Many sites block embedding (X-Frame-Options). Use Go for docs/tools that allow iframes, or open external links from Chat.</div>
+        </section>
+
+        <section class="panel panel-tools" id="panel-tools" role="tabpanel">
+          <div class="panel-header">
+            <strong>AI Tools</strong>
+            <span class="muted" id="tools-count">0 tools</span>
+          </div>
+          <div class="tools-toolbar">
+            <button type="button" class="btn-secondary" id="btn-tools-refresh">Refresh</button>
+            <button type="button" class="btn-secondary" id="btn-tools-create">Create</button>
+            <button type="button" class="btn-secondary" id="btn-tools-import">Import</button>
+            <input type="file" id="tools-import-input" accept=".js,application/javascript,text/javascript" class="hidden" aria-hidden="true">
+          </div>
+          <p class="field-hint muted tools-hint">Workspace = main memory · SMFS = external. Context reader/writer use model token windows. Drop tools/*.js to import.</p>
+          <div id="tools-list" class="tools-list"></div>
+        </section>
+      </div>
+    </main>
+
+    <div id="offline-bar" class="offline-bar hidden" role="status" aria-live="polite">Offline — local llama-server or GGUF required for chat</div>
+    <footer class="app-footer">
+      <span id="version-label">v2.8.0</span>
+      <span>Athuex · 2026 · Broodrix</span>
+    </footer>
+  </div>
+
+  <!-- File action sheet (long-press) -->
+  <div class="sheet" id="file-sheet" aria-hidden="true">
+    <div class="grab"></div>
+    <div class="sheet-name" id="sheet-name">—</div>
+    <div class="sheet-meta" id="sheet-meta">—</div>
+    <div class="sheet-grid" id="sheet-actions">
+      <button type="button" class="act" data-op="open">Open</button>
+      <button type="button" class="act primary" data-op="edit">Edit</button>
+      <button type="button" class="act" data-op="copy">Copy</button>
+      <button type="button" class="act" data-op="paste">Paste</button>
+      <button type="button" class="act" data-op="rename">Rename</button>
+      <button type="button" class="act" data-op="move">Move</button>
+      <button type="button" class="act" data-op="details">Details</button>
+      <button type="button" class="act" data-op="ai-analyse">AI analyse</button>
+      <button type="button" class="act" data-op="ai-run">AI run</button>
+      <button type="button" class="act" data-op="download">Download</button>
+      <button type="button" class="act danger" data-op="delete">Delete</button>
+    </div>
+  </div>
+  <div class="scrim" id="sheet-scrim"></div>
+
+  
+    <section class="panel-program-host hidden" id="panel-program-host" role="dialog" aria-label="Program">
+      <div class="panel-header">
+        <strong id="program-host-title">Program</strong>
+        <button type="button" class="text-btn" id="btn-close-program-host">Close</button>
+      </div>
+      <div class="program-host-body" id="program-host-body"></div>
+    </section>
+
+    <dialog id="settings-dialog" aria-labelledby="settings-title">
+    <div class="dialog-head">
+      <h2 id="settings-title">Settings</h2>
+      <button type="button" id="btn-close-settings" aria-label="Close">✕</button>
+    </div>
+    <label class="field-label" for="api-key">NVIDIA API key</label>
+    <input type="password" id="api-key" placeholder="nvapi-…" autocomplete="off" spellcheck="false">
+    <label class="field-label" for="proxy-url">Cloudflare Worker URL <strong>(required on mobile)</strong></label>
+    <input type="url" id="proxy-url" placeholder="https://….workers.dev" autocomplete="off" spellcheck="false">
+    <p class="help-text">Deploy <code>cloudflare/worker.js</code>. Full https URL.</p>
+    <label class="field-label" for="proxy-key">Proxy key (optional)</label>
+    <input type="password" id="proxy-key" placeholder="Worker PROXY_KEY" autocomplete="off">
+    <label class="field-label" for="mcp-url">MCP Server URL</label>
+    <input type="url" id="mcp-url" placeholder="https://your-mcp-server….workers.dev" autocomplete="off" spellcheck="false">
+    <label class="check-row"><input type="checkbox" id="mcp-via-proxy"> Route MCP via CORS proxy</label>
+    <label class="field-label" for="model-select">Model <span class="muted">(free)</span></label>
+    <div class="model-row">
+    <select id="model-select" aria-label="Model">
+      <option value="nvidia/nemotron-3.5-bolt-e4b">Nemotron 3.5 Bolt (Fast)</option>
+      <option value="nvidia/nemotron-3.5-lightning-30b-a3b">Nemotron 3.5 Lightning</option>
+      <option value="nvidia/nemotron-3.5-super-vl-120b-a12b">Nemotron 3.5 Super VL</option>
+      <option value="deepseek-ai/deepseek-v4.1-flash">DeepSeek V4.1 Flash</option>
+      <option value="z-ai/glm-5.3-flash">GLM 5.3 Flash</option>
+      <option value="minimaxai/minimax-m3.1-flash">MiniMax M3.1 Flash</option>
+    </select>
+      <button type="button" id="btn-star-model" class="icon-btn star-btn" title="Star model">☆</button>
+    </div>
+    <button type="button" id="btn-refresh-models" class="btn-secondary">Refresh free models</button>
+    <label class="field-label" for="llama-server-url">Termux llama-server URL (P2 local preferred)</label>
+    <input type="url" id="llama-server-url" placeholder="http://127.0.0.1:8080" autocomplete="off" spellcheck="false">
+    <p class="help-text">OpenAI-compatible server from Termux (<code>llama-server -m … --port 8080</code>). Preferred over WASM when reachable.</p>
+    <label class="field-label" for="llama-server-model">llama-server model id (optional)</label>
+    <input type="text" id="llama-server-model" placeholder="local" autocomplete="off" spellcheck="false">
+    <button type="button" id="btn-probe-llama" class="btn-secondary">Probe llama-server</button>
+    <p class="muted small" id="llama-server-status">llama-server: not probed</p>
+    <label class="field-label">Local sampling (llama-server / harness)</label>
+    <div class="row" style="display:flex;flex-wrap:wrap;gap:8px;margin:4px 0 8px">
+      <label class="muted small">temp <input type="number" id="local-temp" min="0" max="2" step="0.05" value="0.4" style="width:4.5rem"></label>
+      <label class="muted small">top_p <input type="number" id="local-top-p" min="0" max="1" step="0.05" value="0.9" style="width:4.5rem"></label>
+      <label class="muted small">top_k <input type="number" id="local-top-k" min="0" max="200" step="1" value="40" style="width:4.5rem"></label>
+      <label class="muted small">rep <input type="number" id="local-rep" min="0.5" max="2" step="0.05" value="1.1" style="width:4.5rem"></label>
+      <label class="muted small">max tok <input type="number" id="local-max-tokens" min="64" max="8192" step="64" value="1024" style="width:5rem"></label>
+    </div>
+    <p class="help-text">Applied to Termux llama-server via the harness. Saved with Settings.</p>
+    <label class="field-label" for="ai-mode">AI mode</label>
+    <select id="ai-mode" aria-label="AI mode">
+      <option value="auto">Auto (llama-server / GGUF / NVIDIA)</option>
+      <option value="cloud">NVIDIA only</option>
+      <option value="local">Local only (llama-server or GGUF)</option>
+    </select>
+    <p class="muted small" id="local-model-status">Local: checking…</p>
+    <div class="row" style="display:flex;flex-wrap:wrap;gap:8px;margin:6px 0 10px">
+      <button type="button" id="btn-load-gguf" class="btn-secondary">Load GGUF file</button>
+      <button type="button" id="btn-reload-local" class="btn-secondary">Retry local load</button>
+      <input type="file" id="gguf-file-input" accept=".gguf,application/octet-stream" class="file-input-hidden" tabindex="-1" aria-hidden="true">
+    </div>
+    <p class="muted small"><strong>Local backends:</strong> (1) Termux <code>llama-server</code> when the URL responds; (2) browser wllama Q4_K_M GGUF. Prefer llama-server on Galaxy A06 for speed. See <code>docs/ARCHITECTURE_DECISION_P2.md</code>.</p>
+    <label class="check-row"><input type="checkbox" id="input-ttc"> Test-Time Compute (TTC)</label>
+    <label class="field-label" for="ttc-effort">TTC effort</label>
+    <select id="ttc-effort"><option value="low">low</option><option value="medium" selected>medium</option><option value="high">high</option><option value="max">max</option></select>
+    <label class="check-row"><input type="checkbox" id="input-stream" checked> Stream final answers</label>
+    <label class="check-row"><input type="checkbox" id="input-plan-mode"> Plan-then-act</label>
+    <label class="check-row"><input type="checkbox" id="input-tts"> Speak assistant replies (TTS)</label>
+    <label class="check-row"><input type="checkbox" id="input-swipe" checked> Swipe between panels</label>
+    <label class="field-label" for="github-token">GitHub token</label>
+    <input type="password" id="github-token" placeholder="ghp_…" autocomplete="off">
+    <label class="field-label" for="github-repo">GitHub repo owner/name</label>
+    <input type="text" id="github-repo" placeholder="you/workspace" autocomplete="off">
+    <label class="field-label" for="system-prompt">Extra system prompt</label>
+    <textarea id="system-prompt" rows="2" placeholder="Optional"></textarea>
+    <button type="button" id="btn-install-app" class="btn-secondary hidden">Install app</button>
+    <button type="button" id="btn-open-adapters" class="btn-secondary full" style="margin-top:8px">Harness Adapters…</button>
+    <div class="dialog-actions">
+      <button type="button" id="btn-save-settings" class="btn-primary full">Save</button>
+    </div>
+  </dialog>
+
+  
+    <dialog id="programs-dialog" class="settings-dialog" aria-labelledby="programs-title">
+      <header class="dialog-head">
+        <h2 id="programs-title">Programs</h2>
+        <button type="button" id="btn-close-programs" class="icon-btn" aria-label="Close">✕</button>
+      </header>
+      <div class="dialog-body">
+        <p class="field-hint muted">Put custom apps in workspace <code>programs/*.js</code> (or any .js that calls <code>SG.programsRegistry.register</code>), tap <strong>Scan</strong>, then use <strong>Pin</strong> to add it to the navbar. Chat and About are default pins. Calculator &amp; Test ship built-in.</p>
+        <div id="programs-manager-list" class="programs-manager-list"></div>
+        <hr class="dlg-sep">
+        <h3 class="dlg-sub">Add custom program</h3>
+        <label class="field-label" for="prog-new-id">Id</label>
+        <input type="text" id="prog-new-id" placeholder="notes" autocomplete="off" spellcheck="false">
+        <label class="field-label" for="prog-new-title">Title</label>
+        <input type="text" id="prog-new-title" placeholder="Notes" autocomplete="off">
+        <label class="field-label" for="prog-new-content">Content (HTML)</label>
+        <textarea id="prog-new-content" rows="4" placeholder="<p>Hello</p>"></textarea>
+        <div class="dlg-actions-row">
+          <button type="button" class="btn-primary" id="btn-prog-create">Create</button>
+          <button type="button" class="btn-secondary" id="btn-prog-scan">Scan programs/</button>
+        </div>
+      </div>
+    </dialog>
+
+    <dialog id="about-dialog" aria-labelledby="about-title">
+    <div class="dialog-head">
+      <h2 id="about-title">About Athuex</h2>
+      <button type="button" id="btn-close-about" aria-label="Close">✕</button>
+    </div>
+    <div class="about-body">
+      <p><strong>Athuex <span id="about-version">2.8.0</span></strong> — mobile AI workspace with portable <code>.ssf</code> volumes.</p>
+      <ul>
+        <li><strong>Chat</strong> · <strong>Files</strong> · <strong>IDE</strong> · <strong>Live</strong> · <strong>Browser</strong> · <strong>Tools</strong></li>
+        <li>Long-press files for Open, Edit, AI analyse/run, Download…</li>
+        <li><strong>Offline local:</strong> Termux <code>llama-server</code> (harness + modular adapters) preferred; browser Q4_K_M GGUF fallback.</li>
+        <li><strong>Cloud:</strong> NVIDIA via your Cloudflare worker + proxy key.</li>
+        <li>Default pin: Chat only. Pin About and others from Programs.</li>
+      </ul>
+      <p class="muted">Author: Broodrix · broodrix@gmail.com</p>
+    </div>
+  </dialog>
+
+  <div id="update-toast" class="update-toast hidden" role="status">
+    <span>Update available</span>
+    <button type="button" id="btn-apply-update">Reload</button>
+    <button type="button" id="btn-dismiss-update" class="ghost">Later</button>
+  </div>
+  <div class="toast" id="toast"></div>
+
+
+  <dialog id="adapters-dialog" class="settings-dialog" aria-labelledby="adapters-title">
+    <header class="dialog-head">
+      <h2 id="adapters-title">Harness Adapters</h2>
+      <button type="button" id="btn-close-adapters" class="icon-btn" aria-label="Close">✕</button>
+    </header>
+    <div class="dialog-body">
+      <p class="field-hint muted">Modular plugins for the Termux llama-server harness. Enable only what you need. State is saved on this device. Custom adapters can live in workspace <code>harness/</code> or <code>adapters/</code>.</p>
+      <div id="adapters-grid" class="adapters-grid" role="list"></div>
+      <p class="muted small" id="adapters-status" style="margin-top:10px">—</p>
+    </div>
+  </dialog>
+
+  <dialog id="idb-dialog" class="settings-dialog" aria-labelledby="idb-title">
+    <h2 id="idb-title">IndexedDB</h2>
+    <p class="muted small">Browse local databases used by Athuex (chats, SMFS, settings mirrors).</p>
+    <div id="idb-list" class="idb-list" style="max-height:50vh;overflow:auto;font:12px/1.4 ui-monospace,monospace;white-space:pre-wrap"></div>
+    <div class="dialog-actions">
+      <button type="button" id="btn-idb-refresh" class="btn-secondary">Refresh</button>
+      <button type="button" id="btn-idb-close" class="btn-primary">Close</button>
+    </div>
+  </dialog>
+
+  <script src="js/version.js"></script>
+  <script src="js/settings.js"></script>
+  <script src="js/store.js"></script>
+  <script src="js/vfs.js"></script>
+  <script src="js/ai/local.js"></script>
+  <script src="js/ai/llama_server.js"></script>
+  <script src="js/ai/harness.js"></script>
+  <script src="adapters/consciousness.js"></script>
+  <script src="adapters/neuromorphic.js"></script>
+  <script src="adapters/thermodynamic.js"></script>
+  <script src="adapters/spatial_memory.js"></script>
+  <script src="adapters/sia.js"></script>
+  <script src="adapters/continuous_learning.js"></script>
+  <script src="js/ai/router.js"></script>
+  <script src="js/ai/cloud.js"></script>
+  <script src="js/hybrid_traces.js"></script>
+  <script src="memory/athuex_memory.js"></script>
+  <script src="js/markdown.js"></script>
+  <script src="js/preview.js"></script>
+  <script src="js/runner.js"></script>
+  <script src="js/templates.js"></script>
+  <script src="js/github.js"></script>
+  <script src="programs/registry.js"></script>
+  <script src="programs/chat.js"></script>
+  <script src="programs/files.js"></script>
+  <script src="programs/edit.js"></script>
+  <script src="programs/preview.js"></script>
+  <script src="programs/browser.js"></script>
+  <script src="programs/tools.js"></script>
+  <script src="programs/about.js"></script>
+  <script src="programs/test.js"></script>
+  <script src="programs/calculator.js"></script>
+  <script src="programs/debug_console.js"></script>
+  <script src="js/programs.js"></script>
+  <script src="tools/registry.js"></script>
+  <script src="tools/context_utils.js"></script>
+  <script src="tools/vfs_list.js"></script>
+  <script src="tools/vfs_read.js"></script>
+  <script src="tools/vfs_write.js"></script>
+  <script src="tools/vfs_delete.js"></script>
+  <script src="tools/vfs_replace.js"></script>
+  <script src="tools/file_reader.js"></script>
+  <script src="tools/file_writer.js"></script>
+  <script src="tools/run.js"></script>
+  <script src="tools/preview.js"></script>
+  <script src="tools/smfs.js"></script>
+  <script src="tools/mcp.js"></script>
+  <script src="tools/code.js"></script>
+  <script src="tools/programs_tool.js"></script>
+  <script src="tools/open_program.js"></script>
+  <script src="tools/file_index.js"></script>
+  <script src="tools/errors.js"></script>
+  <script src="tools/tessarune.js"></script>
+  <script src="tools/websearch.js"></script>
+  <script src="tools/memory.js"></script>
+  <script src="tools/harness_tool.js"></script>
+  <script src="js/tools.js"></script>
+  <script src="js/attachments.js"></script>
+  <script src="js/app/helpers.js"></script>
+  <script src="js/app/dialogs.js"></script>
+  <script src="js/app/system_prompt.js"></script>
+  <script src="js/app/offline.js"></script>
+  <script src="js/app/adapters_ui.js"></script>
+  <script src="smfs/persistence.js"></script>
+  <script src="smfs/bridge.js"></script>
+  <script src="js/app.js"></script>
+</body>
+</html>

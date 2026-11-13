@@ -1,0 +1,5 @@
+user_pref::coffee::=user_beverage::hot_espresso
+user_mood::neutral::=user_mood::engaged
+location::home::=environment::quiet_mode
+::=
+user_pref::coffee user_mood::neutral location::home

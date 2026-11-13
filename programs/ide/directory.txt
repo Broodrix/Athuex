@@ -1,0 +1,18 @@
+programs/
+├── ide.js                      ← main entry (registers)
+└── ide/
+    ├── utils.js
+    ├── config.js
+    ├── tokenizers.js
+    ├── vfs.js
+    ├── state.js
+    ├── icons.js
+    ├── styles.js
+    ├── shell.js
+    ├── dialogs.js
+    ├── editor.js
+    ├── tabs.js
+    ├── tree.js
+    ├── palette.js
+    ├── preview.js
+    └── toolbar.js

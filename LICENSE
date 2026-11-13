@@ -1,0 +1,29 @@
+Athuex Proprietary License — Broodrix
+
+Copyright (c) 2025–2026 Broodrix. All rights reserved.
+
+This software and associated documentation files (the "Software"), including but
+not limited to source under core/, native/, android/, js/, tools/, programs/,
+adapters/, memory/, smfs/, scripts/, and project configuration, are the
+proprietary property of Broodrix unless a file carries an explicit third-party
+license notice.
+
+PERMISSION is granted to the licensee to use, copy, and modify the Software solely
+for personal or internal evaluation and operation of Athuex on devices they control.
+
+RESTRICTIONS: You may not redistribute, sublicense, sell, or publish the Software
+(or derivative works of Broodrix-owned files) without prior written permission from
+Broodrix. You may not remove copyright or license notices.
+
+THIRD-PARTY COMPONENTS (retain their licenses):
+  - Dear ImGui — third_party/imgui/LICENSE.txt (MIT)
+  - llama.cpp — third_party/llama.cpp (MIT) when vendored
+  - Other open-source dependencies as indicated in their source headers
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL
+BROODRIX BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY ARISING FROM
+USE OF THE SOFTWARE.
+
+For licensing inquiries: contact Broodrix.
