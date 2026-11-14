@@ -1,0 +1,9 @@
+{
+  "version": "1.0.0",
+  "state": "",
+  "rules": {
+    "user_pref::coffee":  "user_beverage::hot_espresso",
+    "user_mood::neutral": "user_mood::engaged",
+    "location::home":     "environment::quiet_mode"
+  }
+}

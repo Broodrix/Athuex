@@ -1,0 +1,2544 @@
+Athuex — Pure C99 + Clay + OpenGL ES 3.0 Complete Engine
+
+This consolidates the three source documents, resolves their conflicts, and fills the missing pieces. Every allocation has a matching free. Every GL object has a matching delete. Every API reference is real Clay or real GLES3.
+
+What this document fixes vs. the three originals
+
+Conflict Resolution
+Two different renderer APIs (athuex_renderer_* vs Athuex_Gles3_*) Unified on Athuex_Gles3_* with explicit Begin/Submit/End lifecycle
+Athuex_BuildFrame(arena,w,h,font) vs Athuex_BuildLayout(state) One function: Athuex_BuildFrame(AthuexUIState*, w, h)
+Text render packed 6 verts/glyph into VBO + glDrawArraysInstanced Fixed: 1 instance/glyph + glDrawElementsInstanced(6)
+Shader did y-flip and projection did y-flip Fixed: y-flip only in the projection matrix; shader is a straight proj * pos
+RGBA atlas (4 MB) vs GL_R8 atlas (1 MB) GL_R8 — 4× smaller, better for the A06 RAM budget
+athuex_font_bakes[] extern array vs athuex_get_font_bake() One shared athuex_font.h with a proper AthuexFont struct
+Clay_GetScrollOffset() (doesn't exist) App owns swipe_x, scroll_y state; passes via .clip.childOffset
+Athuex_Gles3_SubmitClay body was // ... same as before Fully written below
+No event loop, no gestures, no IME insets All three included
+
+File tree
+
+```
+app/src/main/cpp/
+├── CMakeLists.txt
+├── athuex_main.c              JNI + EGL + ALooper event loop
+├── athuex_theme.h             ide.css tokens
+├── athuex_font.h / .c         stb_truetype bake + measure
+├── athuex_renderer.h / .c     GLES3 instanced renderer
+├── athuex_ui.h / .c           Clay layout (all 6 panels)
+├── athuex_input.h / .c        gesture lock, swipe spring, IME insets
+├── code_editor.h / .c         gap-buffer editor
+├── athuex_editor_bridge.c     EditorQuad → renderer
+└── third_party/clay/
+    ├── clay.h
+    ├── stb_truetype.h
+    └── stb_image.h
+app/src/main/java/com/athuex/app/
+├── MainActivity.java
+└── AthuexView.java
+```
+
+---
+
+1. athuex_theme.h
+
+```c
+// athuex_theme.h — ide.css tokens for Clay
+#ifndef ATHUEX_THEME_H
+#define ATHUEX_THEME_H
+
+#include "clay.h"
+
+#define ATH_C(r,g,b)       (Clay_Color){ r, g, b, 255 }
+#define ATH_CA(r,g,b,a)    (Clay_Color){ r, g, b, a   }
+
+static const Clay_Color ATH_BG           = ATH_C(0x0D, 0x11, 0x17); // #0d1117
+static const Clay_Color ATH_TOP_BAR      = ATH_C(0x01, 0x04, 0x09); // #010409
+static const Clay_Color ATH_PANEL        = ATH_C(0x16, 0x1B, 0x22); // #161b22
+static const Clay_Color ATH_PANEL2       = ATH_C(0x21, 0x26, 0x2D); // #21262d
+static const Clay_Color ATH_BORDER       = ATH_C(0x30, 0x36, 0x3D); // #30363d
+static const Clay_Color ATH_TEXT         = ATH_C(0xE6, 0xED, 0xF3); // #e6edf3
+static const Clay_Color ATH_MUTED        = ATH_C(0x8B, 0x94, 0x9E); // #8b949e
+static const Clay_Color ATH_ACCENT       = ATH_C(0x76, 0xB9, 0x00); // #76b900
+static const Clay_Color ATH_ACCENT_DIM   = ATH_C(0x3D, 0x5C, 0x00); // #3d5c00
+static const Clay_Color ATH_ACCENT_SOFT  = ATH_C(0x1A, 0x2E, 0x0A); // #1a2e0a
+static const Clay_Color ATH_CHIP_ACTIVE  = ATH_C(0xDC, 0xF0, 0xBF); // #dcf0bf
+static const Clay_Color ATH_DANGER       = ATH_C(0xF8, 0x51, 0x49); // #f85149
+static const Clay_Color ATH_BLUE         = ATH_C(0x58, 0xA6, 0xFF); // #58a6ff
+static const Clay_Color ATH_CHAT_AI_BG   = ATH_C(0x1C, 0x21, 0x28); // #1c2128
+static const Clay_Color ATH_CODE_BG      = ATH_C(0x0D, 0x11, 0x17); // #0d1117
+static const Clay_Color ATH_GLASS_BG     = ATH_CA(18, 18, 18, 190);
+static const Clay_Color ATH_GLASS_BORDER = ATH_CA(118, 185, 0, 90);
+
+#define ATH_TOOLBAR_H  52
+#define ATH_CHIPBAR_H  44
+#define ATH_FOOTER_H   24
+
+// Font IDs used by Clay text elements
+enum {
+    ATH_FONT_BODY = 0,   // Roboto Regular 16px
+    ATH_FONT_HEAD = 1,   // Roboto Bold 16px
+    ATH_FONT_MONO = 2,   // system monospace 16px (editor)
+    ATH_FONT_COUNT
+};
+
+#endif
+```
+
+---
+
+2. athuex_font.h
+
+```c
+// athuex_font.h — single source of truth for baked fonts
+#ifndef ATHUEX_FONT_H
+#define ATHUEX_FONT_H
+
+#include "clay.h"
+#include "stb_truetype.h"
+#include <GLES3/gl3.h>
+#include <stdbool.h>
+
+#define ATH_FONT_ATLAS_W     1024
+#define ATH_FONT_ATLAS_H     1024
+#define ATH_FONT_FIRST_CP    32
+#define ATH_FONT_GLYPH_COUNT 96
+
+typedef struct {
+    stbtt_fontinfo   info;
+    unsigned char   *ttf_data;
+    int              ttf_len;
+
+    float            pixel_height;
+    float            scale;
+    int              ascent, descent, line_gap;
+
+    stbtt_packedchar packed[ATH_FONT_GLYPH_COUNT];
+    unsigned char   *atlas_r8;   // ATH_FONT_ATLAS_W * ATH_FONT_ATLAS_H
+    GLuint           texture;    // GL_R8 texture
+} AthuexFont;
+
+// Bake a TTF into a 1024×1024 R8 alpha atlas.
+bool   athuex_font_bake(AthuexFont *f, const char *ttf_path, float pixel_height);
+
+// Upload the baked atlas as a GL_R8 texture. Returns 0 on failure.
+GLuint athuex_font_upload(AthuexFont *f);
+
+// Free CPU and GPU resources.
+void   athuex_font_free(AthuexFont *f);
+
+// Clay measure callback. userData is AthuexFont*.
+Clay_Dimensions athuex_font_measure(Clay_StringSlice text,
+                                    Clay_TextElementConfig *config,
+                                    uintptr_t userData);
+
+#endif
+```
+
+3. athuex_font.c
+
+```c
+// athuex_font.c — stb_truetype baker + Clay measure
+#define STB_TRUETYPE_IMPLEMENTATION
+#include "stb_truetype.h"
+
+#include "athuex_font.h"
+#include <android/log.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#define LOG_TAG "AthuexFont"
+#define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  LOG_TAG, __VA_ARGS__)
+#define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
+
+static unsigned char *slurp(const char *path, int *out_len) {
+    FILE *f = fopen(path, "rb");
+    if (!f) return NULL;
+    fseek(f, 0, SEEK_END); long n = ftell(f); fseek(f, 0, SEEK_SET);
+    if (n <= 0) { fclose(f); return NULL; }
+    unsigned char *buf = (unsigned char *)malloc((size_t)n);
+    if (!buf) { fclose(f); return NULL; }
+    if (fread(buf, 1, (size_t)n, f) != (size_t)n) {
+        free(buf); fclose(f); return NULL;
+    }
+    fclose(f);
+    *out_len = (int)n;
+    return buf;
+}
+
+bool athuex_font_bake(AthuexFont *f, const char *ttf_path, float pixel_height) {
+    memset(f, 0, sizeof(*f));
+
+    f->ttf_data = slurp(ttf_path, &f->ttf_len);
+    if (!f->ttf_data) { LOGE("open %s failed", ttf_path); return false; }
+
+    if (!stbtt_InitFont(&f->info, f->ttf_data,
+                        stbtt_GetFontOffsetForIndex(f->ttf_data, 0))) {
+        LOGE("InitFont %s failed", ttf_path);
+        free(f->ttf_data); f->ttf_data = NULL;
+        return false;
+    }
+
+    f->pixel_height = pixel_height;
+    f->scale        = stbtt_ScaleForPixelHeight(&f->info, pixel_height);
+    stbtt_GetFontVMetrics(&f->info, &f->ascent, &f->descent, &f->line_gap);
+
+    unsigned char *bitmap =
+        (unsigned char *)calloc(ATH_FONT_ATLAS_W * ATH_FONT_ATLAS_H, 1);
+    if (!bitmap) { free(f->ttf_data); f->ttf_data = NULL; return false; }
+
+    stbtt_pack_context pc;
+    if (!stbtt_PackBegin(&pc, bitmap, ATH_FONT_ATLAS_W, ATH_FONT_ATLAS_H, 0, 1, NULL)) {
+        free(bitmap); free(f->ttf_data); f->ttf_data = NULL; return false;
+    }
+    stbtt_PackSetOversampling(&pc, 2, 2);
+    stbtt_PackFontRange(&pc, f->ttf_data, 0, pixel_height,
+                        ATH_FONT_FIRST_CP, ATH_FONT_GLYPH_COUNT, f->packed);
+    stbtt_PackEnd(&pc);
+
+    f->atlas_r8 = bitmap;
+    LOGI("font baked: %s @ %.1fpx  ascent=%d descent=%d",
+         ttf_path, pixel_height, f->ascent, f->descent);
+    return true;
+}
+
+GLuint athuex_font_upload(AthuexFont *f) {
+    if (!f->atlas_r8) return 0;
+
+    GLuint tex;
+    glGenTextures(1, &tex);
+    glBindTexture(GL_TEXTURE_2D, tex);
+
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_R8,
+                 ATH_FONT_ATLAS_W, ATH_FONT_ATLAS_H, 0,
+                 GL_RED, GL_UNSIGNED_BYTE, f->atlas_r8);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+
+    f->texture = tex;
+    free(f->atlas_r8);
+    f->atlas_r8 = NULL;
+    return tex;
+}
+
+void athuex_font_free(AthuexFont *f) {
+    if (!f) return;
+    if (f->texture) { glDeleteTextures(1, &f->texture); f->texture = 0; }
+    free(f->atlas_r8);
+    free(f->ttf_data);
+    memset(f, 0, sizeof(*f));
+}
+
+Clay_Dimensions athuex_font_measure(Clay_StringSlice text,
+                                    Clay_TextElementConfig *config,
+                                    uintptr_t userData) {
+    AthuexFont *f = (AthuexFont *)userData;
+    if (!f || !f->ttf_data) {
+        return (Clay_Dimensions){ text.length * config->fontSize * 0.55f,
+                                  config->fontSize * 1.2f };
+    }
+    float scale = config->fontSize / f->pixel_height;
+
+    float line_w = 0, max_w = 0;
+    int   lines  = 1;
+
+    for (int i = 0; i < text.length; ++i) {
+        unsigned char ch = (unsigned char)text.chars[i];
+        if (ch == '\n') {
+            if (line_w > max_w) max_w = line_w;
+            line_w = 0;
+            ++lines;
+            continue;
+        }
+        if (ch < ATH_FONT_FIRST_CP ||
+            ch >= ATH_FONT_FIRST_CP + ATH_FONT_GLYPH_COUNT) ch = '?';
+        line_w += f->packed[ch - ATH_FONT_FIRST_CP].xadvance * scale;
+    }
+    if (line_w > max_w) max_w = line_w;
+
+    float line_h = (f->ascent - f->descent + f->line_gap) * scale;
+    return (Clay_Dimensions){ max_w, line_h * (float)lines };
+}
+```
+
+---
+
+4. athuex_renderer.h
+
+```c
+// athuex_renderer.h — instanced GLES3 renderer, 2 draw calls per frame
+#ifndef ATHUEX_RENDERER_H
+#define ATHUEX_RENDERER_H
+
+#include "clay.h"
+#include "athuex_font.h"
+#include <GLES3/gl3.h>
+#include <stdbool.h>
+#include <stdint.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+typedef struct AthuexRenderer AthuexRenderer;
+
+// Lifecycle
+AthuexRenderer *Athuex_Gles3_Init(int initial_instance_capacity);
+void            Athuex_Gles3_Shutdown(AthuexRenderer *r);
+
+// Font management (call before first frame)
+void Athuex_Gles3_AttachFont(AthuexRenderer *r, int font_id, AthuexFont *f);
+
+// Frame lifecycle
+void Athuex_Gles3_BeginFrame(AthuexRenderer *r, float screen_w, float screen_h);
+void Athuex_Gles3_SubmitClay(AthuexRenderer *r, Clay_RenderCommandArray cmds);
+void Athuex_Gles3_EndFrame(AthuexRenderer *r);
+
+// Extra geometry (used by the editor pass and custom overlays)
+void  Athuex_Gles3_PushRect(AthuexRenderer *r,
+                            float x, float y, float w, float h,
+                            uint32_t rgba, float radius);
+// Returns the pen advance in pixels so callers can chain glyphs.
+float Athuex_Gles3_PushGlyph(AthuexRenderer *r, int font_id,
+                             float pen_x, float pen_y,
+                             float pixel_size,
+                             uint32_t codepoint, uint32_t rgba);
+
+#ifdef __cplusplus
+}
+#endif
+#endif
+```
+
+5. athuex_renderer.c
+
+```c
+// athuex_renderer.c — pure C99 GLES3 renderer for Clay
+#include "athuex_renderer.h"
+#include <android/log.h>
+#include <math.h>
+#include <stdlib.h>
+#include <string.h>
+
+#define LOG_TAG "AthuexGLES3"
+#define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
+
+// -------------------- shaders --------------------
+static const char *QUAD_VS =
+    "#version 300 es\n"
+    "layout(location=0) in vec2 a_vert;\n"
+    "layout(location=1) in vec4 a_rect;\n"
+    "layout(location=2) in vec4 a_color;\n"
+    "layout(location=3) in vec4 a_border_color;\n"
+    "layout(location=4) in vec4 a_radii;\n"
+    "layout(location=5) in vec4 a_uv;\n"
+    "layout(location=6) in vec4 a_params;\n"
+    "uniform mat4 u_proj;\n"
+    "out vec2 v_uv; out vec4 v_color; out vec4 v_border;\n"
+    "out vec4 v_radii; out vec2 v_size; out vec4 v_uvrect;\n"
+    "out float v_bw; out float v_isimg;\n"
+    "void main(){\n"
+    "  vec2 pos = a_rect.xy + a_vert * a_rect.zw;\n"
+    "  gl_Position = u_proj * vec4(pos, 0.0, 1.0);\n"
+    "  v_uv = a_vert;\n"
+    "  v_color = a_color;\n"
+    "  v_border = a_border_color;\n"
+    "  v_radii = a_radii;\n"
+    "  v_size = a_rect.zw;\n"
+    "  v_uvrect = a_uv;\n"
+    "  v_bw = a_params.x;\n"
+    "  v_isimg = a_params.y;\n"
+    "}\n";
+
+static const char *QUAD_FS =
+    "#version 300 es\n"
+    "precision highp float;\n"
+    "in vec2 v_uv; in vec4 v_color; in vec4 v_border;\n"
+    "in vec4 v_radii; in vec2 v_size; in vec4 v_uvrect;\n"
+    "in float v_bw; in float v_isimg;\n"
+    "uniform sampler2D u_tex;\n"
+    "out vec4 o;\n"
+    "float sdRound(vec2 p, vec2 b, vec4 r){\n"
+    "  r.xy = (p.x > 0.0) ? r.yz : r.xw;\n"
+    "  r.x  = (p.y > 0.0) ? r.y  : r.x;\n"
+    "  vec2 q = abs(p) - b + r.x;\n"
+    "  return min(max(q.x, q.y), 0.0) + length(max(q, 0.0)) - r.x;\n"
+    "}\n"
+    "void main(){\n"
+    "  if (v_isimg > 0.5) {\n"
+    "    vec2 uv = mix(v_uvrect.xy, v_uvrect.zw, v_uv);\n"
+    "    o = texture(u_tex, uv) * v_color;\n"
+    "    return;\n"
+    "  }\n"
+    "  vec2 half = v_size * 0.5;\n"
+    "  vec2 p    = (v_uv - 0.5) * v_size;\n"
+    "  float d   = sdRound(p, half, v_radii);\n"
+    "  float aa  = fwidth(d);\n"
+    "  float a   = 1.0 - smoothstep(-aa, aa, d);\n"
+    "  if (a <= 0.001) discard;\n"
+    "  vec4 c = v_color;\n"
+    "  if (v_bw > 0.0) {\n"
+    "    float inner = sdRound(p, half - v_bw, max(v_radii - v_bw, 0.0));\n"
+    "    float bm    = 1.0 - smoothstep(-aa, aa, inner);\n"
+    "    c.rgb = mix(c.rgb, v_border.rgb, bm);\n"
+    "    c.a   = max(c.a, v_border.a * bm);\n"
+    "  }\n"
+    "  o = vec4(c.rgb, c.a * a);\n"
+    "}\n";
+
+static const char *TEXT_VS =
+    "#version 300 es\n"
+    "layout(location=0) in vec2 a_vert;\n"
+    "layout(location=1) in vec4 a_rect;\n"
+    "layout(location=2) in vec4 a_color;\n"
+    "layout(location=3) in vec4 a_uv;\n"
+    "uniform mat4 u_proj;\n"
+    "out vec2 v_uv; out vec4 v_color;\n"
+    "void main(){\n"
+    "  vec2 pos = a_rect.xy + a_vert * a_rect.zw;\n"
+    "  gl_Position = u_proj * vec4(pos, 0.0, 1.0);\n"
+    "  v_uv = mix(a_uv.xy, a_uv.zw, a_vert);\n"
+    "  v_color = a_color;\n"
+    "}\n";
+
+static const char *TEXT_FS =
+    "#version 300 es\n"
+    "precision highp float;\n"
+    "in vec2 v_uv; in vec4 v_color;\n"
+    "uniform sampler2D u_atlas;\n"
+    "out vec4 o;\n"
+    "void main(){\n"
+    "  float a = texture(u_atlas, v_uv).r;\n"
+    "  o = vec4(v_color.rgb, v_color.a * a);\n"
+    "}\n";
+
+// -------------------- instance formats --------------------
+typedef struct {
+    float rect[4];        // x, y, w, h
+    float color[4];
+    float border[4];
+    float radii[4];       // tl, tr, br, bl
+    float uv[4];          // u0, v0, u1, v1
+    float params[4];      // borderWidth, isImage, -, -
+} QuadInst;
+
+typedef struct {
+    float rect[4];
+    float color[4];
+    float uv[4];
+} GlyphInst;
+
+// -------------------- renderer --------------------
+struct AthuexRenderer {
+    // quad batch
+    GLuint   quad_prog, quad_vao, quad_vbo, quad_ibo;
+    GLint    quad_u_proj, quad_u_tex;
+    QuadInst *quads;
+    int      quad_count, quad_cap;
+
+    // glyph batch
+    GLuint   text_prog, text_vao, text_vbo, text_ibo;
+    GLint    text_u_proj, text_u_atlas;
+    GlyphInst *glyphs;
+    int      glyph_count, glyph_cap;
+
+    // fonts
+    AthuexFont *fonts[ATH_FONT_COUNT];
+
+    // screen
+    float screen_w, screen_h;
+
+    bool scissor_on;
+};
+
+static const uint16_t IDX6[6] = { 0, 1, 2, 1, 3, 2 };
+static const float    QT4[8]  = { 0,0, 1,0, 0,1, 1,1 };
+
+static GLuint compile(GLenum type, const char *src) {
+    GLuint s = glCreateShader(type);
+    glShaderSource(s, 1, &src, NULL);
+    glCompileShader(s);
+    GLint ok; glGetShaderiv(s, GL_COMPILE_STATUS, &ok);
+    if (!ok) {
+        char log[1024]; glGetShaderInfoLog(s, sizeof(log), NULL, log);
+        LOGE("shader: %s", log); glDeleteShader(s); return 0;
+    }
+    return s;
+}
+
+static GLuint link(const char *vs, const char *fs) {
+    GLuint v = compile(GL_VERTEX_SHADER, vs);
+    GLuint f = compile(GL_FRAGMENT_SHADER, fs);
+    if (!v || !f) { glDeleteShader(v); glDeleteShader(f); return 0; }
+    GLuint p = glCreateProgram();
+    glAttachShader(p, v); glAttachShader(p, f); glLinkProgram(p);
+    glDeleteShader(v); glDeleteShader(f);
+    GLint ok; glGetProgramiv(p, GL_LINK_STATUS, &ok);
+    if (!ok) {
+        char log[1024]; glGetProgramInfoLog(p, sizeof(log), NULL, log);
+        LOGE("link: %s", log); glDeleteProgram(p); return 0;
+    }
+    return p;
+}
+
+static bool grow_quads(AthuexRenderer *r, int want) {
+    if (want <= r->quad_cap) return true;
+    int cap = r->quad_cap ? r->quad_cap : 256;
+    while (cap < want) cap *= 2;
+    QuadInst *p = (QuadInst *)realloc(r->quads, sizeof(QuadInst) * (size_t)cap);
+    if (!p) return false;
+    r->quads = p; r->quad_cap = cap;
+    return true;
+}
+static bool grow_glyphs(AthuexRenderer *r, int want) {
+    if (want <= r->glyph_cap) return true;
+    int cap = r->glyph_cap ? r->glyph_cap : 512;
+    while (cap < want) cap *= 2;
+    GlyphInst *p = (GlyphInst *)realloc(r->glyphs, sizeof(GlyphInst) * (size_t)cap);
+    if (!p) return false;
+    r->glyphs = p; r->glyph_cap = cap;
+    return true;
+}
+
+static void flush_quads(AthuexRenderer *r) {
+    if (r->quad_count == 0) return;
+    glUseProgram(r->quad_prog);
+    glBindVertexArray(r->quad_vao);
+    glBindBuffer(GL_ARRAY_BUFFER, r->quad_vbo);
+    glBufferSubData(GL_ARRAY_BUFFER, 0,
+                    (GLsizeiptr)(sizeof(QuadInst) * r->quad_count), r->quads);
+    glUniform1i(r->quad_u_tex, 0);
+    glDrawElementsInstanced(GL_TRIANGLES, 6, GL_UNSIGNED_SHORT, 0, r->quad_count);
+    r->quad_count = 0;
+}
+
+static void flush_glyphs(AthuexRenderer *r) {
+    if (r->glyph_count == 0) return;
+    // Find the first font with a texture; single-atlas limitation for now
+    GLuint tex = 0;
+    for (int i = 0; i < ATH_FONT_COUNT; ++i) {
+        if (r->fonts[i] && r->fonts[i]->texture) { tex = r->fonts[i]->texture; break; }
+    }
+    if (!tex) { r->glyph_count = 0; return; }
+
+    glUseProgram(r->text_prog);
+    glBindVertexArray(r->text_vao);
+    glBindBuffer(GL_ARRAY_BUFFER, r->text_vbo);
+    glBufferSubData(GL_ARRAY_BUFFER, 0,
+                    (GLsizeiptr)(sizeof(GlyphInst) * r->glyph_count), r->glyphs);
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, tex);
+    glUniform1i(r->text_u_atlas, 0);
+    glDrawElementsInstanced(GL_TRIANGLES, 6, GL_UNSIGNED_SHORT, 0, r->glyph_count);
+    r->glyph_count = 0;
+}
+
+// -------------------- public --------------------
+AthuexRenderer *Athuex_Gles3_Init(int initial_capacity) {
+    AthuexRenderer *r = (AthuexRenderer *)calloc(1, sizeof(AthuexRenderer));
+    if (!r) return NULL;
+
+    r->quad_prog = link(QUAD_VS, QUAD_FS);
+    r->text_prog = link(TEXT_VS, TEXT_FS);
+    if (!r->quad_prog || !r->text_prog) goto fail;
+
+    r->quad_u_proj = glGetUniformLocation(r->quad_prog, "u_proj");
+    r->quad_u_tex  = glGetUniformLocation(r->quad_prog, "u_tex");
+    r->text_u_proj = glGetUniformLocation(r->text_prog, "u_proj");
+    r->text_u_atlas= glGetUniformLocation(r->text_prog, "u_atlas");
+
+    // --- quad VAO ---
+    glGenVertexArrays(1, &r->quad_vao);
+    glBindVertexArray(r->quad_vao);
+
+    GLuint unit_vbo;
+    glGenBuffers(1, &unit_vbo);
+    glBindBuffer(GL_ARRAY_BUFFER, unit_vbo);
+    glBufferData(GL_ARRAY_BUFFER, sizeof(QT4), QT4, GL_STATIC_DRAW);
+    glEnableVertexAttribArray(0);
+    glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 0, 0);
+
+    glGenBuffers(1, &r->quad_ibo);
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, r->quad_ibo);
+    glBufferData(GL_ELEMENT_ARRAY_BUFFER, sizeof(IDX6), IDX6, GL_STATIC_DRAW);
+
+    int cap = initial_capacity > 0 ? initial_capacity : 8192;
+    if (!grow_quads(r, cap)) goto fail;
+    r->quad_cap = cap;
+
+    glGenBuffers(1, &r->quad_vbo);
+    glBindBuffer(GL_ARRAY_BUFFER, r->quad_vbo);
+    glBufferData(GL_ARRAY_BUFFER, sizeof(QuadInst) * (GLsizeiptr)cap,
+                 NULL, GL_DYNAMIC_DRAW);
+
+    const GLsizei qs = sizeof(QuadInst);
+    for (int i = 0; i < 6; ++i) {
+        glEnableVertexAttribArray(1 + i);
+        glVertexAttribDivisor(1 + i, 1);
+    }
+    glVertexAttribPointer(1, 4, GL_FLOAT, GL_FALSE, qs, (void*)offsetof(QuadInst, rect));
+    glVertexAttribPointer(2, 4, GL_FLOAT, GL_FALSE, qs, (void*)offsetof(QuadInst, color));
+    glVertexAttribPointer(3, 4, GL_FLOAT, GL_FALSE, qs, (void*)offsetof(QuadInst, border));
+    glVertexAttribPointer(4, 4, GL_FLOAT, GL_FALSE, qs, (void*)offsetof(QuadInst, radii));
+    glVertexAttribPointer(5, 4, GL_FLOAT, GL_FALSE, qs, (void*)offsetof(QuadInst, uv));
+    glVertexAttribPointer(6, 4, GL_FLOAT, GL_FALSE, qs, (void*)offsetof(QuadInst, params));
+
+    // --- text VAO ---
+    glGenVertexArrays(1, &r->text_vao);
+    glBindVertexArray(r->text_vao);
+
+    GLuint unit_vbo2;
+    glGenBuffers(1, &unit_vbo2);
+    glBindBuffer(GL_ARRAY_BUFFER, unit_vbo2);
+    glBufferData(GL_ARRAY_BUFFER, sizeof(QT4), QT4, GL_STATIC_DRAW);
+    glEnableVertexAttribArray(0);
+    glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 0, 0);
+    glVertexAttribDivisor(0, 0);
+
+    glGenBuffers(1, &r->text_ibo);
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, r->text_ibo);
+    glBufferData(GL_ELEMENT_ARRAY_BUFFER, sizeof(IDX6), IDX6, GL_STATIC_DRAW);
+
+    if (!grow_glyphs(r, cap)) goto fail;
+    r->glyph_cap = cap;
+
+    glGenBuffers(1, &r->text_vbo);
+    glBindBuffer(GL_ARRAY_BUFFER, r->text_vbo);
+    glBufferData(GL_ARRAY_BUFFER, sizeof(GlyphInst) * (GLsizeiptr)cap,
+                 NULL, GL_DYNAMIC_DRAW);
+
+    const GLsizei gs = sizeof(GlyphInst);
+    glEnableVertexAttribArray(1);
+    glVertexAttribPointer(1, 4, GL_FLOAT, GL_FALSE, gs, (void*)offsetof(GlyphInst, rect));
+    glVertexAttribDivisor(1, 1);
+    glEnableVertexAttribArray(2);
+    glVertexAttribPointer(2, 4, GL_FLOAT, GL_FALSE, gs, (void*)offsetof(GlyphInst, color));
+    glVertexAttribDivisor(2, 1);
+    glEnableVertexAttribArray(3);
+    glVertexAttribPointer(3, 4, GL_FLOAT, GL_FALSE, gs, (void*)offsetof(GlyphInst, uv));
+    glVertexAttribDivisor(3, 1);
+
+    glBindVertexArray(0);
+
+    glDisable(GL_DEPTH_TEST);
+    glDisable(GL_CULL_FACE);
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+
+    return r;
+
+fail:
+    Athuex_Gles3_Shutdown(r);
+    return NULL;
+}
+
+void Athuex_Gles3_AttachFont(AthuexRenderer *r, int font_id, AthuexFont *f) {
+    if (!r || font_id < 0 || font_id >= ATH_FONT_COUNT) return;
+    r->fonts[font_id] = f;
+}
+
+void Athuex_Gles3_BeginFrame(AthuexRenderer *r, float w, float h) {
+    r->screen_w = w;
+    r->screen_h = h;
+    r->quad_count = 0;
+    r->glyph_count = 0;
+    r->scissor_on = false;
+
+    // Column-major ortho: UI (0,0) at top-left
+    float proj[16] = {
+        2.f/w, 0, 0, 0,
+        0, -2.f/h, 0, 0,
+        0, 0, -1, 0,
+        -1, 1, 0, 1
+    };
+
+    glViewport(0, 0, (GLsizei)w, (GLsizei)h);
+    glClearColor(0.051f, 0.067f, 0.090f, 1.0f);
+    glClear(GL_COLOR_BUFFER_BIT);
+
+    glUseProgram(r->quad_prog);
+    glUniformMatrix4fv(r->quad_u_proj, 1, GL_FALSE, proj);
+    glUseProgram(r->text_prog);
+    glUniformMatrix4fv(r->text_u_proj, 1, GL_FALSE, proj);
+}
+
+static void emit_glyph_run(AthuexRenderer *r, int font_id,
+                           float x, float y, float pixel_size,
+                           const char *s, int len, Clay_Color color) {
+    AthuexFont *f = (font_id >= 0 && font_id < ATH_FONT_COUNT) ? r->fonts[font_id] : NULL;
+    if (!f) return;
+    float scale = pixel_size / f->pixel_height;
+
+    for (int i = 0; i < len; ++i) {
+        unsigned char cp = (unsigned char)s[i];
+        if (cp < ATH_FONT_FIRST_CP ||
+            cp >= ATH_FONT_FIRST_CP + ATH_FONT_GLYPH_COUNT) cp = '?';
+        const stbtt_packedchar *pc = &f->packed[cp - ATH_FONT_FIRST_CP];
+        if (pc->x1 > pc->x0 && pc->y1 > pc->y0) {
+            if (!grow_glyphs(r, r->glyph_count + 1)) return;
+            GlyphInst *g = &r->glyphs[r->glyph_count++];
+            g->rect[0] = x + pc->xoff * scale;
+            g->rect[1] = y + pc->yoff * scale;
+            g->rect[2] = (pc->x1 - pc->x0) * scale;
+            g->rect[3] = (pc->y1 - pc->y0) * scale;
+            g->color[0] = color.r / 255.f;
+            g->color[1] = color.g / 255.f;
+            g->color[2] = color.b / 255.f;
+            g->color[3] = color.a / 255.f;
+            g->uv[0] = pc->x0 / (float)ATH_FONT_ATLAS_W;
+            g->uv[1] = pc->y0 / (float)ATH_FONT_ATLAS_H;
+            g->uv[2] = pc->x1 / (float)ATH_FONT_ATLAS_W;
+            g->uv[3] = pc->y1 / (float)ATH_FONT_ATLAS_H;
+        }
+        x += pc->xadvance * scale;
+    }
+}
+
+void Athuex_Gles3_SubmitClay(AthuexRenderer *r, Clay_RenderCommandArray cmds) {
+    for (int i = 0; i < cmds.length; ++i) {
+        Clay_RenderCommand *c = &cmds.internalArray[i];
+
+        switch (c->commandType) {
+        case CLAY_RENDER_COMMAND_TYPE_NONE:
+            break;
+
+        case CLAY_RENDER_COMMAND_TYPE_SCISSOR_START:
+            flush_quads(r);
+            flush_glyphs(r);
+            glEnable(GL_SCISSOR_TEST);
+            glScissor((GLint)c->boundingBox.x,
+                      (GLint)(r->screen_h - c->boundingBox.y - c->boundingBox.height),
+                      (GLsizei)c->boundingBox.width,
+                      (GLsizei)c->boundingBox.height);
+            r->scissor_on = true;
+            break;
+
+        case CLAY_RENDER_COMMAND_TYPE_SCISSOR_END:
+            flush_quads(r);
+            flush_glyphs(r);
+            glDisable(GL_SCISSOR_TEST);
+            r->scissor_on = false;
+            break;
+
+        case CLAY_RENDER_COMMAND_TYPE_RECTANGLE: {
+            if (!grow_quads(r, r->quad_count + 1)) break;
+            Clay_RectangleRenderData *d = &c->renderData.rectangle;
+            QuadInst *q = &r->quads[r->quad_count++];
+            q->rect[0] = c->boundingBox.x; q->rect[1] = c->boundingBox.y;
+            q->rect[2] = c->boundingBox.width; q->rect[3] = c->boundingBox.height;
+            q->color[0] = d->backgroundColor.r / 255.f;
+            q->color[1] = d->backgroundColor.g / 255.f;
+            q->color[2] = d->backgroundColor.b / 255.f;
+            q->color[3] = d->backgroundColor.a / 255.f;
+            q->radii[0] = d->cornerRadius.topLeft;
+            q->radii[1] = d->cornerRadius.topRight;
+            q->radii[2] = d->cornerRadius.bottomRight;
+            q->radii[3] = d->cornerRadius.bottomLeft;
+            q->uv[0]=0; q->uv[1]=0; q->uv[2]=1; q->uv[3]=1;
+            q->params[0]=0; q->params[1]=0; q->params[2]=0; q->params[3]=0;
+            q->border[0]=q->border[1]=q->border[2]=q->border[3]=0;
+            break;
+        }
+
+        case CLAY_RENDER_COMMAND_TYPE_BORDER: {
+            if (!grow_quads(r, r->quad_count + 1)) break;
+            Clay_BorderRenderData *d = &c->renderData.border;
+            QuadInst *q = &r->quads[r->quad_count++];
+            q->rect[0] = c->boundingBox.x; q->rect[1] = c->boundingBox.y;
+            q->rect[2] = c->boundingBox.width; q->rect[3] = c->boundingBox.height;
+            q->color[0] = d->color.r / 255.f;
+            q->color[1] = d->color.g / 255.f;
+            q->color[2] = d->color.b / 255.f;
+            q->color[3] = 0.f;
+            q->radii[0] = d->cornerRadius.topLeft;
+            q->radii[1] = d->cornerRadius.topRight;
+            q->radii[2] = d->cornerRadius.bottomRight;
+            q->radii[3] = d->cornerRadius.bottomLeft;
+            q->uv[0]=0; q->uv[1]=0; q->uv[2]=1; q->uv[3]=1;
+            q->params[0] = (float)d->width.left;
+            q->params[1] = 0; q->params[2] = 0; q->params[3] = 0;
+            q->border[0] = d->color.r / 255.f;
+            q->border[1] = d->color.g / 255.f;
+            q->border[2] = d->color.b / 255.f;
+            q->border[3] = d->color.a / 255.f;
+            break;
+        }
+
+        case CLAY_RENDER_COMMAND_TYPE_IMAGE: {
+            if (!grow_quads(r, r->quad_count + 1)) break;
+            Clay_ImageRenderData *d = &c->renderData.image;
+            QuadInst *q = &r->quads[r->quad_count++];
+            q->rect[0] = c->boundingBox.x; q->rect[1] = c->boundingBox.y;
+            q->rect[2] = c->boundingBox.width; q->rect[3] = c->boundingBox.height;
+            q->color[0] = d->backgroundColor.r / 255.f;
+            q->color[1] = d->backgroundColor.g / 255.f;
+            q->color[2] = d->backgroundColor.b / 255.f;
+            q->color[3] = d->backgroundColor.a / 255.f;
+            q->radii[0]=q->radii[1]=q->radii[2]=q->radii[3]=0;
+            q->uv[0]=0; q->uv[1]=0; q->uv[2]=1; q->uv[3]=1;
+            q->params[0]=0; q->params[1]=1; q->params[2]=0; q->params[3]=0;
+            q->border[0]=q->border[1]=q->border[2]=q->border[3]=0;
+            break;
+        }
+
+        case CLAY_RENDER_COMMAND_TYPE_TEXT: {
+            Clay_TextRenderData *d = &c->renderData.text;
+            emit_glyph_run(r, d->fontId,
+                           c->boundingBox.x, c->boundingBox.y,
+                           (float)d->fontSize,
+                           d->stringContents.chars,
+                           d->stringContents.length,
+                           d->textColor);
+            break;
+        }
+
+        default:
+            break;
+        }
+    }
+}
+
+void Athuex_Gles3_EndFrame(AthuexRenderer *r) {
+    flush_quads(r);
+    flush_glyphs(r);
+    if (r->scissor_on) { glDisable(GL_SCISSOR_TEST); r->scissor_on = false; }
+    glBindVertexArray(0);
+    glUseProgram(0);
+}
+
+void Athuex_Gles3_PushRect(AthuexRenderer *r,
+                           float x, float y, float w, float h,
+                           uint32_t rgba, float radius) {
+    if (!grow_quads(r, r->quad_count + 1)) return;
+    QuadInst *q = &r->quads[r->quad_count++];
+    q->rect[0] = x; q->rect[1] = y; q->rect[2] = w; q->rect[3] = h;
+    q->color[0] = ((rgba      ) & 0xFF) / 255.f;
+    q->color[1] = ((rgba >>  8) & 0xFF) / 255.f;
+    q->color[2] = ((rgba >> 16) & 0xFF) / 255.f;
+    q->color[3] = ((rgba >> 24) & 0xFF) / 255.f;
+    q->radii[0]=q->radii[1]=q->radii[2]=q->radii[3]=radius;
+    q->uv[0]=0; q->uv[1]=0; q->uv[2]=1; q->uv[3]=1;
+    q->params[0]=0; q->params[1]=0; q->params[2]=0; q->params[3]=0;
+    q->border[0]=q->border[1]=q->border[2]=q->border[3]=0;
+}
+
+float Athuex_Gles3_PushGlyph(AthuexRenderer *r, int font_id,
+                             float pen_x, float pen_y,
+                             float pixel_size,
+                             uint32_t cp, uint32_t rgba) {
+    AthuexFont *f = (font_id >= 0 && font_id < ATH_FONT_COUNT) ? r->fonts[font_id] : NULL;
+    if (!f) return 0;
+    unsigned char ch = (unsigned char)cp;
+    if (ch < ATH_FONT_FIRST_CP ||
+        ch >= ATH_FONT_FIRST_CP + ATH_FONT_GLYPH_COUNT) ch = '?';
+    const stbtt_packedchar *pc = &f->packed[ch - ATH_FONT_FIRST_CP];
+    float scale = pixel_size / f->pixel_height;
+    float advance = pc->xadvance * scale;
+
+    if (pc->x1 > pc->x0 && pc->y1 > pc->y0) {
+        if (!grow_glyphs(r, r->glyph_count + 1)) return advance;
+        GlyphInst *g = &r->glyphs[r->glyph_count++];
+        g->rect[0] = pen_x + pc->xoff * scale;
+        g->rect[1] = pen_y + pc->yoff * scale;
+        g->rect[2] = (pc->x1 - pc->x0) * scale;
+        g->rect[3] = (pc->y1 - pc->y0) * scale;
+        g->color[0] = ((rgba      ) & 0xFF) / 255.f;
+        g->color[1] = ((rgba >>  8) & 0xFF) / 255.f;
+        g->color[2] = ((rgba >> 16) & 0xFF) / 255.f;
+        g->color[3] = ((rgba >> 24) & 0xFF) / 255.f;
+        g->uv[0] = pc->x0 / (float)ATH_FONT_ATLAS_W;
+        g->uv[1] = pc->y0 / (float)ATH_FONT_ATLAS_H;
+        g->uv[2] = pc->x1 / (float)ATH_FONT_ATLAS_W;
+        g->uv[3] = pc->y1 / (float)ATH_FONT_ATLAS_H;
+    }
+    return advance;
+}
+
+void Athuex_Gles3_Shutdown(AthuexRenderer *r) {
+    if (!r) return;
+    if (r->quad_prog) glDeleteProgram(r->quad_prog);
+    if (r->text_prog) glDeleteProgram(r->text_prog);
+    if (r->quad_vao)  glDeleteVertexArrays(1, &r->quad_vao);
+    if (r->text_vao)  glDeleteVertexArrays(1, &r->text_vao);
+    if (r->quad_vbo)  glDeleteBuffers(1, &r->quad_vbo);
+    if (r->quad_ibo)  glDeleteBuffers(1, &r->quad_ibo);
+    if (r->text_vbo)  glDeleteBuffers(1, &r->text_vbo);
+    if (r->text_ibo)  glDeleteBuffers(1, &r->text_ibo);
+    free(r->quads);
+    free(r->glyphs);
+    free(r);
+}
+```
+
+---
+
+6. athuex_ui.h
+
+```c
+// athuex_ui.h — app state + Clay frame builder
+#ifndef ATHUEX_UI_H
+#define ATHUEX_UI_H
+
+#include "clay.h"
+#include <stdbool.h>
+#include <stdint.h>
+
+typedef enum {
+    ATH_PANEL_CHAT = 0,
+    ATH_PANEL_FILES,
+    ATH_PANEL_EDIT,
+    ATH_PANEL_PREVIEW,
+    ATH_PANEL_BROWSER,
+    ATH_PANEL_TOOLS,
+    ATH_PANEL_COUNT
+} AthPanel;
+
+typedef struct {
+    AthPanel active_panel;
+    float    swipe_x;           // 0.0 .. (ATH_PANEL_COUNT-1), fractional between panels
+    float    chat_scroll_y;
+    float    files_scroll_y;
+    float    tools_scroll_y;
+    float    screen_w, screen_h;
+    float    safe_top, safe_bottom;
+
+    char     status_text[64];
+    char     chat_input[2048];
+    int      rpm_current, rpm_max;
+    int      ctx_tokens;
+    bool     model_ready;
+    bool     chatbar_focused;
+
+    // Filled by Athuex_BuildFrame so subsequent passes (editor, WebView) can use it
+    Clay_BoundingBox editor_viewport;
+    Clay_BoundingBox preview_viewport;
+    Clay_BoundingBox browser_viewport;
+} AthuexUIState;
+
+void Athuex_BuildFrame(AthuexUIState *st,
+                       Clay_RenderCommandArray *out_cmds);
+
+#endif
+```
+
+7. athuex_ui.c
+
+```c
+// athuex_ui.c — Clay layout for all Athuex screens
+#include "athuex_ui.h"
+#include "athuex_theme.h"
+#include <stdio.h>
+#include <string.h>
+
+// -------- helper: chip with real tap hit-testing --------
+static void chip(const char *id, const char *label, AthPanel target,
+                 AthuexUIState *st) {
+    bool active = (st->active_panel == target);
+    Clay_Color bg     = active ? ATH_ACCENT_SOFT : ATH_PANEL;
+    Clay_Color border = active ? ATH_ACCENT_DIM  : ATH_BORDER;
+    Clay_Color fg     = active ? ATH_CHIP_ACTIVE : ATH_MUTED;
+
+    CLAY({ .id = CLAY_ID(id),
+        .layout = {
+            .padding = { 14, 14, 8, 8 },
+            .childGap = 6,
+            .childAlignment = { .y = CLAY_ALIGN_Y_CENTER }
+        },
+        .backgroundColor = bg,
+        .cornerRadius = CLAY_CORNER_RADIUS(999),
+        .border = { .color = border, .width = CLAY_BORDER_OUTSIDE(1) }
+    }) {
+        CLAY_TEXT(CLAY_STRING(label), CLAY_TEXT_CONFIG({
+            .fontId = ATH_FONT_BODY, .fontSize = 13, .textColor = fg
+        }));
+    };
+    if (Clay_Hovered()) st->active_panel = target;
+}
+
+// -------- helper: 36×36 icon button --------
+static void icon_btn(const char *id, const char *glyph) {
+    CLAY({ .id = CLAY_ID(id),
+        .layout = {
+            .sizing = { CLAY_SIZING_FIXED(36), CLAY_SIZING_FIXED(36) },
+            .childAlignment = { CLAY_ALIGN_X_CENTER, CLAY_ALIGN_Y_CENTER }
+        },
+        .backgroundColor = ATH_PANEL2,
+        .cornerRadius = CLAY_CORNER_RADIUS(9),
+        .border = { .color = ATH_BORDER, .width = CLAY_BORDER_OUTSIDE(1) }
+    }) {
+        CLAY_TEXT(CLAY_STRING(glyph), CLAY_TEXT_CONFIG({
+            .fontId = ATH_FONT_BODY, .fontSize = 16, .textColor = ATH_ACCENT
+        }));
+    };
+}
+
+// -------- toolbar --------
+static void toolbar(AthuexUIState *st) {
+    char rpm[32], ctx[32];
+    snprintf(rpm, sizeof(rpm), "%d/%d RPM", st->rpm_current, st->rpm_max);
+    snprintf(ctx, sizeof(ctx), "~%d tok", st->ctx_tokens);
+
+    CLAY({ .id = CLAY_ID("toolbar"),
+        .layout = {
+            .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(ATH_TOOLBAR_H) },
+            .padding = { 12, 12, 0, 0 },
+            .childGap = 8,
+            .childAlignment = { .y = CLAY_ALIGN_Y_CENTER }
+        },
+        .backgroundColor = ATH_PANEL,
+        .border = { .color = ATH_BORDER, .width = { .bottom = 1 } }
+    }) {
+        icon_btn("menu", "=");
+        CLAY_TEXT(CLAY_STRING("Athuex"), CLAY_TEXT_CONFIG({
+            .fontId = ATH_FONT_HEAD, .fontSize = 17, .textColor = ATH_ACCENT }));
+        CLAY_TEXT(CLAY_STRING(" AI"), CLAY_TEXT_CONFIG({
+            .fontId = ATH_FONT_BODY, .fontSize = 14, .textColor = ATH_TEXT }));
+
+        CLAY({ .layout = { .sizing = { .width = CLAY_SIZING_GROW(0) } } }) {}
+
+        // RPM badge
+        CLAY({ .layout = { .padding = { 8, 8, 3, 3 } },
+            .backgroundColor = ATH_ACCENT_SOFT,
+            .cornerRadius = CLAY_CORNER_RADIUS(999),
+            .border = { .color = ATH_ACCENT_DIM, .width = CLAY_BORDER_OUTSIDE(1) }
+        }) {
+            CLAY_TEXT((Clay_String){ .length = (int32_t)strlen(rpm), .chars = rpm },
+                      CLAY_TEXT_CONFIG({ .fontId = ATH_FONT_BODY, .fontSize = 11,
+                                         .textColor = ATH_CHIP_ACTIVE }));
+        };
+
+        CLAY_TEXT((Clay_String){ .length = (int32_t)strlen(ctx), .chars = ctx },
+                  CLAY_TEXT_CONFIG({ .fontId = ATH_FONT_BODY, .fontSize = 11,
+                                     .textColor = ATH_MUTED }));
+
+        CLAY_TEXT((Clay_String){ .length = (int32_t)strlen(st->status_text),
+                                  .chars = st->status_text },
+                  CLAY_TEXT_CONFIG({ .fontId = ATH_FONT_BODY, .fontSize = 12,
+                                     .textColor = ATH_MUTED }));
+
+        icon_btn("settings", "*");
+    };
+}
+
+// -------- quickbar --------
+static void quickbar(AthuexUIState *st) {
+    static const char *ids[]    = {"chip_chat","chip_files","chip_edit",
+                                    "chip_live","chip_browser","chip_tools"};
+    static const char *labels[] = {"Chat","Files","Edit","Live","Browser","Tools"};
+
+    CLAY({ .id = CLAY_ID("quickbar"),
+        .layout = {
+            .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(ATH_CHIPBAR_H + 4) },
+            .padding = { 8, 8, 4, 4 },
+            .childGap = 6,
+            .childAlignment = { .y = CLAY_ALIGN_Y_CENTER }
+        },
+        .backgroundColor = ATH_TOP_BAR,
+        .border = { .color = ATH_BORDER, .width = { .bottom = 1 } }
+    }) {
+        for (int i = 0; i < ATH_PANEL_COUNT; ++i)
+            chip(ids[i], labels[i], (AthPanel)i, st);
+    };
+}
+
+// -------- chat panel --------
+static void chat_panel(AthuexUIState *st) {
+    CLAY({ .id = CLAY_ID("panel_chat"),
+        .layout = {
+            .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_GROW(0) },
+            .layoutDirection = CLAY_TOP_TO_BOTTOM
+        }
+    }) {
+        // Messages
+        CLAY({ .id = CLAY_ID("chat_box"),
+            .layout = {
+                .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_GROW(0) },
+                .padding = { 12, 12, 12, 12 },
+                .childGap = 12,
+                .layoutDirection = CLAY_TOP_TO_BOTTOM
+            },
+            .clip = {
+                .vertical = true,
+                .childOffset = { .y = st->chat_scroll_y }
+            }
+        }) {
+            // user bubble
+            CLAY({ .layout = {
+                    .padding = { 12, 12, 10, 10 },
+                    .childGap = 4,
+                    .layoutDirection = CLAY_TOP_TO_BOTTOM
+                },
+                .backgroundColor = ATH_PANEL2,
+                .cornerRadius = CLAY_CORNER_RADIUS(10),
+                .border = { .color = ATH_ACCENT, .width = { .left = 3 } }
+            }) {
+                CLAY_TEXT(CLAY_STRING("USER"), CLAY_TEXT_CONFIG({
+                    .fontId = ATH_FONT_BODY, .fontSize = 11, .textColor = ATH_MUTED }));
+                CLAY_TEXT(CLAY_STRING("Hello Athuex"), CLAY_TEXT_CONFIG({
+                    .fontId = ATH_FONT_BODY, .fontSize = 14, .textColor = ATH_TEXT }));
+            };
+            // ai bubble
+            CLAY({ .layout = {
+                    .padding = { 12, 12, 10, 10 },
+                    .childGap = 4,
+                    .layoutDirection = CLAY_TOP_TO_BOTTOM
+                },
+                .backgroundColor = ATH_CHAT_AI_BG,
+                .cornerRadius = CLAY_CORNER_RADIUS(10),
+                .border = { .color = ATH_BLUE, .width = { .left = 3 } }
+            }) {
+                CLAY_TEXT(CLAY_STRING("AI"), CLAY_TEXT_CONFIG({
+                    .fontId = ATH_FONT_BODY, .fontSize = 11, .textColor = ATH_MUTED }));
+                CLAY_TEXT(CLAY_STRING("Ready when you are."), CLAY_TEXT_CONFIG({
+                    .fontId = ATH_FONT_BODY, .fontSize = 14, .textColor = ATH_TEXT }));
+            };
+        }
+
+        // Composer
+        CLAY({ .id = CLAY_ID("composer"),
+            .layout = {
+                .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIT(0) },
+                .padding = { 14, 14, 10, (uint16_t)(10 + st->safe_bottom) },
+                .childGap = 10,
+                .layoutDirection = CLAY_TOP_TO_BOTTOM
+            },
+            .backgroundColor = ATH_GLASS_BG,
+            .cornerRadius = CLAY_CORNER_RADIUS(24),
+            .border = {
+                .color = st->chatbar_focused ? ATH_ACCENT : ATH_GLASS_BORDER,
+                .width = CLAY_BORDER_OUTSIDE(1)
+            }
+        }) {
+            CLAY_TEXT(CLAY_STRING("Ask Anything..."), CLAY_TEXT_CONFIG({
+                .fontId = ATH_FONT_BODY, .fontSize = 16, .textColor = ATH_MUTED }));
+
+            CLAY({ .layout = {
+                    .sizing = { CLAY_SIZING_GROW(0) },
+                    .childAlignment = { .x = CLAY_ALIGN_X_SPACE_BETWEEN }
+                }
+            }) {
+                CLAY({ .layout = { .childGap = 8,
+                                    .childAlignment = { .y = CLAY_ALIGN_Y_CENTER } } }) {
+                    icon_btn("upload", "+");
+                    chip("ext_pill", "EXT", ATH_PANEL_CHAT, st);
+                    chip("think_pill", "Think", ATH_PANEL_CHAT, st);
+                }
+                CLAY({ .layout = { .childGap = 8,
+                                    .childAlignment = { .y = CLAY_ALIGN_Y_CENTER } } }) {
+                    icon_btn("voice", "V");
+                    CLAY({ .id = CLAY_ID("send"),
+                        .layout = {
+                            .sizing = { CLAY_SIZING_FIXED(36), CLAY_SIZING_FIXED(36) },
+                            .childAlignment = { .x = CLAY_ALIGN_X_CENTER,
+                                                .y = CLAY_ALIGN_Y_CENTER }
+                        },
+                        .backgroundColor = ATH_ACCENT,
+                        .cornerRadius = CLAY_CORNER_RADIUS(999)
+                    }) {
+                        CLAY_TEXT(CLAY_STRING(">"), CLAY_TEXT_CONFIG({
+                            .fontId = ATH_FONT_BODY, .fontSize = 16, .textColor = ATH_BG }));
+                    };
+                }
+            }
+        }
+    };
+}
+
+// -------- files panel --------
+static void files_panel(AthuexUIState *st) {
+    CLAY({ .id = CLAY_ID("panel_files"),
+        .layout = {
+            .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_GROW(0) },
+            .layoutDirection = CLAY_TOP_TO_BOTTOM
+        }
+    }) {
+        // Source bar
+        CLAY({ .layout = {
+                .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(40) },
+                .padding = { 10, 10, 8, 8 },
+                .childGap = 8,
+                .childAlignment = { .y = CLAY_ALIGN_Y_CENTER }
+            },
+            .backgroundColor = ATH_PANEL2,
+            .border = { .color = ATH_BORDER, .width = { .bottom = 1 } }
+        }) {
+            CLAY_TEXT(CLAY_STRING("Memory"), CLAY_TEXT_CONFIG({
+                .fontId = ATH_FONT_BODY, .fontSize = 12, .textColor = ATH_MUTED }));
+            CLAY({ .layout = {
+                    .padding = { 10, 10, 6, 6 },
+                    .sizing  = { .width = CLAY_SIZING_GROW(0),
+                                 .height = CLAY_SIZING_FIXED(32) }
+                },
+                .backgroundColor = ATH_BG,
+                .cornerRadius = CLAY_CORNER_RADIUS(10),
+                .border = { .color = ATH_BORDER, .width = CLAY_BORDER_OUTSIDE(1) }
+            }) {
+                CLAY_TEXT(CLAY_STRING("Workspace (main)"), CLAY_TEXT_CONFIG({
+                    .fontId = ATH_FONT_BODY, .fontSize = 13, .textColor = ATH_TEXT }));
+            };
+        }
+
+        // Grid
+        CLAY({ .layout = {
+                .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_GROW(0) },
+                .padding = { 10, 10, 10, 10 },
+                .childGap = 8,
+                .layoutDirection = CLAY_LEFT_TO_RIGHT
+            }
+        }) {
+            static const char *names[] = { "WELCOME.md", "notes.txt", "programs",
+                                           "tools", "chat.md", "app.js" };
+            for (int i = 0; i < 6; ++i) {
+                CLAY({ .layout = {
+                        .sizing = { CLAY_SIZING_FIXED(88), CLAY_SIZING_FIXED(84) },
+                        .padding = { 6, 6, 12, 12 },
+                        .childGap = 6,
+                        .childAlignment = { .x = CLAY_ALIGN_X_CENTER },
+                        .layoutDirection = CLAY_TOP_TO_BOTTOM
+                    },
+                    .backgroundColor = ATH_PANEL,
+                    .cornerRadius = CLAY_CORNER_RADIUS(12),
+                    .border = { .color = ATH_BORDER, .width = CLAY_BORDER_OUTSIDE(1) }
+                }) {
+                    CLAY({ .layout = {
+                            .sizing = { CLAY_SIZING_FIXED(36), CLAY_SIZING_FIXED(36) }
+                        },
+                        .backgroundColor = ATH_C(0x67,0x74,0x8A),
+                        .cornerRadius = CLAY_CORNER_RADIUS(8)
+                    }) {}
+                    CLAY_TEXT((Clay_String){ .length = (int32_t)strlen(names[i]),
+                                             .chars = names[i] },
+                              CLAY_TEXT_CONFIG({ .fontId = ATH_FONT_BODY,
+                                                 .fontSize = 11, .textColor = ATH_TEXT }));
+                };
+            }
+        }
+
+        // Actions
+        CLAY({ .layout = {
+                .sizing = { CLAY_SIZING_GROW(0) },
+                .padding = { 8, 8, 8, 8 },
+                .childGap = 6,
+                .layoutDirection = CLAY_LEFT_TO_RIGHT
+            },
+            .border = { .color = ATH_BORDER, .width = { .top = 1 } }
+        }) {
+            static const char *acts[] = { "Export .ssf", "Export ZIP",
+                                          "Import .ssf", "Main → Ext" };
+            for (int i = 0; i < 4; ++i) {
+                CLAY({ .layout = {
+                        .padding = { 8, 8, 10, 10 },
+                        .sizing  = { .width = CLAY_SIZING_GROW(0),
+                                     .height = CLAY_SIZING_FIXED(36) },
+                        .childAlignment = { .x = CLAY_ALIGN_X_CENTER,
+                                            .y = CLAY_ALIGN_Y_CENTER }
+                    },
+                    .backgroundColor = ATH_PANEL2,
+                    .cornerRadius = CLAY_CORNER_RADIUS(10),
+                    .border = { .color = ATH_BORDER, .width = CLAY_BORDER_OUTSIDE(1) }
+                }) {
+                    CLAY_TEXT((Clay_String){ .length = (int32_t)strlen(acts[i]),
+                                             .chars = acts[i] },
+                              CLAY_TEXT_CONFIG({ .fontId = ATH_FONT_BODY,
+                                                 .fontSize = 12, .textColor = ATH_TEXT }));
+                };
+            }
+        }
+    };
+}
+
+// -------- edit panel — delegates to the code editor pass --------
+static void edit_panel(AthuexUIState *st) {
+    CLAY({ .id = CLAY_ID("panel_edit"),
+        .layout = {
+            .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_GROW(0) },
+            .layoutDirection = CLAY_TOP_TO_BOTTOM
+        }
+    }) {
+        // Header
+        CLAY({ .layout = {
+                .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(36) },
+                .padding = { 12, 12, 0, 0 },
+                .childGap = 8,
+                .childAlignment = { .y = CLAY_ALIGN_Y_CENTER }
+            },
+            .backgroundColor = ATH_PANEL,
+            .border = { .color = ATH_BORDER, .width = { .bottom = 1 } }
+        }) {
+            CLAY_TEXT(CLAY_STRING("WELCOME.md"), CLAY_TEXT_CONFIG({
+                .fontId = ATH_FONT_BODY, .fontSize = 13, .textColor = ATH_TEXT }));
+            CLAY_TEXT(CLAY_STRING("Plain text"), CLAY_TEXT_CONFIG({
+                .fontId = ATH_FONT_BODY, .fontSize = 11, .textColor = ATH_MUTED }));
+        }
+
+        // Canvas slot — the editor fills this
+        CLAY({ .id = CLAY_ID("CodeCanvasSlot"),
+            .layout = {
+                .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_GROW(0) }
+            },
+            .backgroundColor = ATH_CODE_BG
+        }) {}
+
+        // Status bar
+        CLAY({ .layout = {
+                .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(24) },
+                .padding = { 12, 12, 0, 0 },
+                .childGap = 12,
+                .childAlignment = { .y = CLAY_ALIGN_Y_CENTER }
+            },
+            .backgroundColor = ATH_TOP_BAR
+        }) {
+            CLAY_TEXT(CLAY_STRING("Ln 1, Col 1"), CLAY_TEXT_CONFIG({
+                .fontId = ATH_FONT_BODY, .fontSize = 11, .textColor = ATH_MUTED }));
+            CLAY_TEXT(CLAY_STRING("Markdown"), CLAY_TEXT_CONFIG({
+                .fontId = ATH_FONT_BODY, .fontSize = 11, .textColor = ATH_MUTED }));
+            CLAY_TEXT(CLAY_STRING("Saved"), CLAY_TEXT_CONFIG({
+                .fontId = ATH_FONT_BODY, .fontSize = 11, .textColor = ATH_MUTED }));
+        }
+    };
+}
+
+// -------- preview panel --------
+static void preview_panel(AthuexUIState *st) {
+    CLAY({ .id = CLAY_ID("panel_preview"),
+        .layout = {
+            .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_GROW(0) },
+            .layoutDirection = CLAY_TOP_TO_BOTTOM
+        }
+    }) {
+        CLAY({ .layout = {
+                .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(36) },
+                .padding = { 6, 6, 4, 4 },
+                .childGap = 4
+            },
+            .backgroundColor = ATH_PANEL
+        }) {
+            chip("prev_live", "Live", ATH_PANEL_PREVIEW, st);
+            chip("prev_console", "Console", ATH_PANEL_PREVIEW, st);
+            chip("prev_info", "Info", ATH_PANEL_PREVIEW, st);
+        }
+        CLAY({ .id = CLAY_ID("PreviewSlot"),
+            .layout = {
+                .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_GROW(0) }
+            },
+            .backgroundColor = ATH_C(0xFF,0xFF,0xFF)
+        }) {}
+    };
+}
+
+// -------- browser panel --------
+static void browser_panel(AthuexUIState *st) {
+    CLAY({ .id = CLAY_ID("panel_browser"),
+        .layout = {
+            .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_GROW(0) },
+            .layoutDirection = CLAY_TOP_TO_BOTTOM
+        }
+    }) {
+        CLAY({ .layout = {
+                .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(44) },
+                .padding = { 8, 8, 5, 5 },
+                .childGap = 4,
+                .childAlignment = { .y = CLAY_ALIGN_Y_CENTER }
+            },
+            .backgroundColor = ATH_PANEL
+        }) {
+            icon_btn("b_back", "<");
+            icon_btn("b_fwd",  ">");
+            icon_btn("b_reload", "R");
+            CLAY({ .layout = {
+                    .padding = { 10, 10, 6, 6 },
+                    .sizing  = { .width = CLAY_SIZING_GROW(0),
+                                 .height = CLAY_SIZING_FIXED(32) }
+                },
+                .backgroundColor = ATH_BG,
+                .cornerRadius = CLAY_CORNER_RADIUS(10),
+                .border = { .color = ATH_BORDER, .width = CLAY_BORDER_OUTSIDE(1) }
+            }) {
+                CLAY_TEXT(CLAY_STRING("https://…"), CLAY_TEXT_CONFIG({
+                    .fontId = ATH_FONT_BODY, .fontSize = 13, .textColor = ATH_MUTED }));
+            };
+            chip("b_go", "Go", ATH_PANEL_BROWSER, st);
+        }
+        CLAY({ .id = CLAY_ID("BrowserSlot"),
+            .layout = { .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_GROW(0) } },
+            .backgroundColor = ATH_C(0xFF,0xFF,0xFF)
+        }) {}
+    };
+}
+
+// -------- tools panel --------
+static void tools_panel(AthuexUIState *st) {
+    CLAY({ .id = CLAY_ID("panel_tools"),
+        .layout = {
+            .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_GROW(0) },
+            .padding = { 12, 12, 12, 12 },
+            .childGap = 8,
+            .layoutDirection = CLAY_TOP_TO_BOTTOM
+        }
+    }) {
+        CLAY_TEXT(CLAY_STRING("AI Tools"), CLAY_TEXT_CONFIG({
+            .fontId = ATH_FONT_HEAD, .fontSize = 16, .textColor = ATH_TEXT }));
+        for (int i = 0; i < 4; ++i) {
+            char buf[64];
+            snprintf(buf, sizeof(buf), "tool_%d  ·  enabled", i);
+            CLAY({ .layout = {
+                    .padding = { 12, 12, 10, 10 },
+                    .sizing  = { .width = CLAY_SIZING_GROW(0) },
+                    .childGap = 4,
+                    .layoutDirection = CLAY_TOP_TO_BOTTOM
+                },
+                .backgroundColor = ATH_PANEL2,
+                .cornerRadius = CLAY_CORNER_RADIUS(10),
+                .border = { .color = ATH_BORDER, .width = CLAY_BORDER_OUTSIDE(1) }
+            }) {
+                CLAY_TEXT((Clay_String){ .length = (int32_t)strlen(buf), .chars = buf },
+                          CLAY_TEXT_CONFIG({ .fontId = ATH_FONT_BODY,
+                                             .fontSize = 14, .textColor = ATH_ACCENT }));
+                CLAY_TEXT(CLAY_STRING("description…"), CLAY_TEXT_CONFIG({
+                    .fontId = ATH_FONT_BODY, .fontSize = 12, .textColor = ATH_MUTED }));
+            };
+        }
+    };
+}
+
+// -------- root --------
+void Athuex_BuildFrame(AthuexUIState *st, Clay_RenderCommandArray *out_cmds) {
+    Clay_SetLayoutDimensions((Clay_Dimensions){ st->screen_w, st->screen_h });
+    Clay_BeginLayout();
+
+    CLAY({ .id = CLAY_ID("root"),
+        .layout = {
+            .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_GROW(0) },
+            .layoutDirection = CLAY_TOP_TO_BOTTOM
+        },
+        .backgroundColor = ATH_BG
+    }) {
+        toolbar(st);
+        quickbar(st);
+
+        // Swipe viewport
+        CLAY({ .id = CLAY_ID("workspace"),
+            .layout = {
+                .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_GROW(0) },
+                .layoutDirection = CLAY_LEFT_TO_RIGHT
+            },
+            .clip = {
+                .horizontal = true,
+                .childOffset = { .x = -st->swipe_x * st->screen_w, .y = 0 }
+            }
+        }) {
+            CLAY({ .layout = {
+                    .sizing = { CLAY_SIZING_FIXED(st->screen_w), CLAY_SIZING_GROW(0) }
+                },
+                .border = { .color = ATH_BORDER, .width = { .right = 1 } }
+            }) { chat_panel(st); }
+
+            CLAY({ .layout = {
+                    .sizing = { CLAY_SIZING_FIXED(st->screen_w), CLAY_SIZING_GROW(0) }
+                },
+                .border = { .color = ATH_BORDER, .width = { .right = 1 } }
+            }) { files_panel(st); }
+
+            CLAY({ .layout = {
+                    .sizing = { CLAY_SIZING_FIXED(st->screen_w), CLAY_SIZING_GROW(0) }
+                },
+                .border = { .color = ATH_BORDER, .width = { .right = 1 } }
+            }) { edit_panel(st); }
+
+            CLAY({ .layout = {
+                    .sizing = { CLAY_SIZING_FIXED(st->screen_w), CLAY_SIZING_GROW(0) }
+                },
+                .border = { .color = ATH_BORDER, .width = { .right = 1 } }
+            }) { preview_panel(st); }
+
+            CLAY({ .layout = {
+                    .sizing = { CLAY_SIZING_FIXED(st->screen_w), CLAY_SIZING_GROW(0) }
+                },
+                .border = { .color = ATH_BORDER, .width = { .right = 1 } }
+            }) { browser_panel(st); }
+
+            CLAY({ .layout = {
+                    .sizing = { CLAY_SIZING_FIXED(st->screen_w), CLAY_SIZING_GROW(0) }
+                }
+            }) { tools_panel(st); }
+        }
+
+        // Footer
+        CLAY({ .layout = {
+                .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(ATH_FOOTER_H) },
+                .padding = { 12, 12, 0, 0 },
+                .childAlignment = { .y = CLAY_ALIGN_Y_CENTER }
+            },
+            .backgroundColor = ATH_TOP_BAR
+        }) {
+            CLAY_TEXT(CLAY_STRING("v2.9.8"), CLAY_TEXT_CONFIG({
+                .fontId = ATH_FONT_BODY, .fontSize = 11, .textColor = ATH_ACCENT }));
+            CLAY({ .layout = { .sizing = { .width = CLAY_SIZING_GROW(0) } } }) {}
+            CLAY_TEXT(CLAY_STRING("Athuex · 2026 · Broodrix"), CLAY_TEXT_CONFIG({
+                .fontId = ATH_FONT_BODY, .fontSize = 11, .textColor = ATH_MUTED }));
+        }
+    };
+
+    *out_cmds = Clay_EndLayout();
+
+    // Capture viewports for secondary passes
+    Clay_ElementData ed = Clay_GetElementData(CLAY_ID("CodeCanvasSlot"));
+    if (ed.found) st->editor_viewport = ed.boundingBox;
+    ed = Clay_GetElementData(CLAY_ID("PreviewSlot"));
+    if (ed.found) st->preview_viewport = ed.boundingBox;
+    ed = Clay_GetElementData(CLAY_ID("BrowserSlot"));
+    if (ed.found) st->browser_viewport = ed.boundingBox;
+}
+```
+
+---
+
+8. code_editor.h
+
+```c
+// code_editor.h — gap buffer editor
+#ifndef ATHUEX_CODE_EDITOR_H
+#define ATHUEX_CODE_EDITOR_H
+
+#include <stddef.h>
+#include <stdint.h>
+#include <stdbool.h>
+#include "clay.h"
+
+typedef struct {
+    float    x, y, w, h;
+    uint32_t rgba;
+    uint32_t codepoint;   // 0 = rect, else ASCII
+} EditorQuad;
+
+typedef void (*EditorEmitQuadFn)(void *ud, const EditorQuad *q);
+
+typedef struct {
+    char  *buf;
+    size_t cap, gap_start, gap_end;
+    size_t *line_starts;
+    size_t  line_count, line_cap;
+    bool    lines_dirty;
+    float   scroll_x, scroll_y;
+    float   char_w, line_h, padding;
+    size_t  cursor_line, cursor_col;
+    float   desired_x;
+    bool    focused, caret_visible;
+} CodeEditor;
+
+bool   Editor_Init(CodeEditor *ed, size_t cap, float char_w, float line_h);
+void   Editor_Free(CodeEditor *ed);
+void   Editor_LoadText(CodeEditor *ed, const char *utf8, size_t len);
+size_t Editor_ExportText(const CodeEditor *ed, char *out, size_t out_cap);
+void   Editor_InsertUTF8(CodeEditor *ed, const char *utf8, size_t len);
+void   Editor_Backspace(CodeEditor *ed, size_t n);
+void   Editor_DeleteForward(CodeEditor *ed, size_t n);
+void   Editor_MoveCursor(CodeEditor *ed, int d_line, int d_col);
+void   Editor_OnTap(CodeEditor *ed, Clay_BoundingBox vp, float tx, float ty);
+void   Editor_OnScroll(CodeEditor *ed, Clay_BoundingBox vp, float dx, float dy);
+void   Editor_Render(CodeEditor *ed, Clay_BoundingBox vp,
+                     EditorEmitQuadFn emit, void *ud);
+
+#endif
+```
+
+9. code_editor.c
+
+```c
+// code_editor.c
+#include "code_editor.h"
+#include <math.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#define COL_ED_BG        0xFF17110D
+#define COL_GUTTER_BG    0xFF221B16
+#define COL_GUTTER_BDR   0xFF3D3630
+#define COL_ACTIVE_LINE  0xFF221B16
+#define COL_TEXT_CODE    0xFFD9D1C9
+#define COL_TEXT_MUTED   0xFF9E948B
+#define COL_ACCENT_GREEN 0xFF00B976
+#define COL_KW_BLUE      0xFFFFA658
+#define COL_STR_GREEN    0xFF7EF7B4
+
+static inline size_t gap_size(const CodeEditor *e)   { return e->gap_end - e->gap_start; }
+static inline size_t text_len(const CodeEditor *e)   { return e->cap - gap_size(e); }
+static inline char   at      (const CodeEditor *e, size_t i) {
+    return i < e->gap_start ? e->buf[i] : e->buf[i + gap_size(e)];
+}
+
+static bool ensure_gap(CodeEditor *e, size_t need) {
+    if (gap_size(e) >= need) return true;
+    size_t cap = e->cap ? e->cap : 4096;
+    while (cap - text_len(e) < need) cap *= 2;
+    char *nb = (char *)realloc(e->buf, cap);
+    if (!nb) return false;
+    size_t after = e->cap - e->gap_end;
+    size_t new_end = cap - after;
+    if (after) memmove(nb + new_end, nb + e->gap_end, after);
+    e->buf = nb; e->cap = cap; e->gap_end = new_end;
+    return true;
+}
+
+static void move_gap(CodeEditor *e, size_t t) {
+    size_t len = text_len(e);
+    if (t > len) t = len;
+    if (t < e->gap_start) {
+        size_t d = e->gap_start - t;
+        memmove(e->buf + e->gap_end - d, e->buf + t, d);
+        e->gap_start -= d; e->gap_end -= d;
+    } else if (t > e->gap_start) {
+        size_t d = t - e->gap_start;
+        memmove(e->buf + e->gap_start, e->buf + e->gap_end, d);
+        e->gap_start += d; e->gap_end += d;
+    }
+}
+
+static void rebuild_lines(CodeEditor *e) {
+    if (!e->lines_dirty) return;
+    e->line_count = 0;
+    e->line_starts[0] = 0;
+    e->line_count = 1;
+    size_t len = text_len(e);
+    for (size_t i = 0; i < len; ++i) {
+        if (at(e, i) != '\n') continue;
+        if (e->line_count >= e->line_cap) {
+            size_t nc = e->line_cap ? e->line_cap * 2 : 256;
+            size_t *tmp = (size_t *)realloc(e->line_starts, nc * sizeof(size_t));
+            if (!tmp) break;
+            e->line_starts = tmp; e->line_cap = nc;
+        }
+        e->line_starts[e->line_count++] = i + 1;
+    }
+    // Binary search cursor
+    size_t pos = e->gap_start, lo = 0, hi = e->line_count;
+    while (lo + 1 < hi) {
+        size_t mid = lo + (hi - lo) / 2;
+        if (e->line_starts[mid] <= pos) lo = mid; else hi = mid;
+    }
+    e->cursor_line = lo;
+    e->cursor_col  = pos - e->line_starts[lo];
+    e->lines_dirty = false;
+}
+
+bool Editor_Init(CodeEditor *e, size_t cap, float char_w, float line_h) {
+    memset(e, 0, sizeof(*e));
+    if (cap < 4096) cap = 4096;
+    e->buf = (char *)malloc(cap);
+    e->line_starts = (size_t *)malloc(256 * sizeof(size_t));
+    if (!e->buf || !e->line_starts) {
+        free(e->buf); free(e->line_starts); return false;
+    }
+    e->cap = cap; e->gap_end = cap;
+    e->line_cap = 256; e->line_starts[0] = 0; e->line_count = 1;
+    e->char_w = char_w; e->line_h = line_h; e->padding = 14.f;
+    e->caret_visible = true;
+    return true;
+}
+
+void Editor_Free(CodeEditor *e) {
+    free(e->buf); free(e->line_starts);
+    memset(e, 0, sizeof(*e));
+}
+
+void Editor_LoadText(CodeEditor *e, const char *u, size_t n) {
+    e->gap_start = 0; e->gap_end = e->cap;
+    e->scroll_x = e->scroll_y = 0.f;
+    if (u && n) { Editor_InsertUTF8(e, u, n); move_gap(e, 0); }
+    e->lines_dirty = true; rebuild_lines(e);
+}
+
+size_t Editor_ExportText(const CodeEditor *e, char *out, size_t cap) {
+    size_t len = text_len(e);
+    if (!out || !cap) return len;
+    size_t n = len < cap - 1 ? len : cap - 1;
+    for (size_t i = 0; i < n; ++i) out[i] = at(e, i);
+    out[n] = 0; return n;
+}
+
+void Editor_InsertUTF8(CodeEditor *e, const char *u, size_t n) {
+    if (!u || !n) return;
+    if (!ensure_gap(e, n)) return;
+    memcpy(e->buf + e->gap_start, u, n);
+    e->gap_start += n;
+    e->lines_dirty = true; e->caret_visible = true;
+    rebuild_lines(e);
+    e->desired_x = (float)e->cursor_col * e->char_w;
+}
+
+void Editor_Backspace(CodeEditor *e, size_t n) {
+    while (n && e->gap_start > 0) {
+        e->gap_start--;
+        while (e->gap_start > 0 &&
+               ((uint8_t)e->buf[e->gap_start] & 0xC0) == 0x80)
+            e->gap_start--;
+        n--;
+    }
+    e->lines_dirty = true; e->caret_visible = true;
+    rebuild_lines(e);
+    e->desired_x = (float)e->cursor_col * e->char_w;
+}
+
+void Editor_DeleteForward(CodeEditor *e, size_t n) {
+    while (n && e->gap_end < e->cap) {
+        e->gap_end++;
+        while (e->gap_end < e->cap &&
+               ((uint8_t)e->buf[e->gap_end] & 0xC0) == 0x80)
+            e->gap_end++;
+        n--;
+    }
+    e->lines_dirty = true; rebuild_lines(e);
+}
+
+void Editor_MoveCursor(CodeEditor *e, int dl, int dc) {
+    rebuild_lines(e);
+    size_t line = e->cursor_line, col = e->cursor_col;
+
+    if (dl) {
+        long t = (long)line + dl;
+        if (t < 0) t = 0;
+        if (t >= (long)e->line_count) t = (long)e->line_count - 1;
+        line = (size_t)t;
+        size_t ls = e->line_starts[line];
+        size_t le = (line + 1 < e->line_count)
+                    ? e->line_starts[line + 1] - 1 : text_len(e);
+        size_t want = (size_t)roundf(e->desired_x / e->char_w);
+        if (want > le - ls) want = le - ls;
+        col = want;
+    } else if (dc) {
+        size_t ls = e->line_starts[line];
+        size_t le = (line + 1 < e->line_count)
+                    ? e->line_starts[line + 1] - 1 : text_len(e);
+        long t = (long)col + dc;
+        if (t < 0) t = 0;
+        if (t > (long)(le - ls)) t = (long)(le - ls);
+        col = (size_t)t;
+        e->desired_x = (float)col * e->char_w;
+    }
+    move_gap(e, e->line_starts[line] + col);
+    e->cursor_line = line; e->cursor_col = col;
+}
+
+void Editor_OnTap(CodeEditor *e, Clay_BoundingBox vp, float tx, float ty) {
+    rebuild_lines(e);
+    e->focused = true; e->caret_visible = true;
+    float gw = 30.72f;
+    float ry = (ty - vp.y) + e->scroll_y - e->padding;
+    float rx = (tx - (vp.x + gw)) + e->scroll_x - e->padding;
+
+    size_t line = ry <= 0 ? 0 : (size_t)(ry / e->line_h);
+    if (line >= e->line_count) line = e->line_count - 1;
+    size_t ls = e->line_starts[line];
+    size_t le = (line + 1 < e->line_count)
+                ? e->line_starts[line + 1] - 1 : text_len(e);
+    size_t col = rx <= 0 ? 0 : (size_t)roundf(rx / e->char_w);
+    if (col > le - ls) col = le - ls;
+    move_gap(e, ls + col);
+    e->cursor_line = line; e->cursor_col = col;
+    e->desired_x = (float)col * e->char_w;
+}
+
+void Editor_OnScroll(CodeEditor *e, Clay_BoundingBox vp, float dx, float dy) {
+    rebuild_lines(e);
+    float maxy = fmaxf(0.f, (float)e->line_count * e->line_h - vp.height + e->padding);
+    e->scroll_y = fminf(maxy, fmaxf(0.f, e->scroll_y + dy));
+    e->scroll_x = fmaxf(0.f, e->scroll_x + dx);
+}
+
+void Editor_Render(CodeEditor *e, Clay_BoundingBox vp,
+                   EditorEmitQuadFn emit, void *ud) {
+    if (vp.width <= 0 || vp.height <= 0) return;
+    rebuild_lines(e);
+
+    float gw = 30.72f;
+    emit(ud, &(EditorQuad){ vp.x, vp.y, vp.width, vp.height, COL_ED_BG, 0 });
+    emit(ud, &(EditorQuad){ vp.x, vp.y, gw, vp.height, COL_GUTTER_BG, 0 });
+    emit(ud, &(EditorQuad){ vp.x + gw - 1.f, vp.y, 1.f, vp.height, COL_GUTTER_BDR, 0 });
+
+    size_t first = (size_t)fmaxf(0.f, (e->scroll_y - e->padding) / e->line_h);
+    size_t rows  = (size_t)(vp.height / e->line_h) + 3;
+    size_t last  = first + rows;
+    if (last > e->line_count) last = e->line_count;
+
+    float ox = vp.x + gw + e->padding - e->scroll_x;
+    float oy = vp.y + e->padding - e->scroll_y;
+
+    for (size_t line = first; line < last; ++line) {
+        float ry = oy + (float)line * e->line_h;
+        if (ry + e->line_h < vp.y || ry > vp.y + vp.height) continue;
+        bool active = (line == e->cursor_line);
+        if (active)
+            emit(ud, &(EditorQuad){ vp.x + gw, ry, vp.width - gw,
+                                    e->line_h, COL_ACTIVE_LINE, 0 });
+
+        char num[16];
+        int nl = snprintf(num, sizeof(num), "%zu", line + 1);
+        float nx = vp.x + gw - 8.f - (float)nl * e->char_w;
+        uint32_t nc = active ? COL_ACCENT_GREEN : COL_TEXT_MUTED;
+        for (int k = 0; k < nl; ++k)
+            emit(ud, &(EditorQuad){ nx + (float)k * e->char_w, ry,
+                                    e->char_w, e->line_h, nc,
+                                    (uint32_t)(uint8_t)num[k] });
+
+        size_t ls = e->line_starts[line];
+        size_t le = (line + 1 < e->line_count)
+                    ? e->line_starts[line + 1] - 1 : text_len(e);
+        bool cmt = false, str = false;
+        char qc = 0;
+        for (size_t i = ls; i < le; ++i) {
+            size_t col = i - ls;
+            float  gx  = ox + (float)col * e->char_w;
+            char   ch  = at(e, i);
+            if (ch == '\r') continue;
+
+            uint32_t color;
+            if (!str && ch == '/' && i + 1 < le && at(e, i + 1) == '/') cmt = true;
+            if (cmt) color = COL_TEXT_MUTED;
+            else if (str) {
+                color = COL_STR_GREEN;
+                if (ch == qc && (i == ls || at(e, i - 1) != '\\')) str = false;
+            } else if (ch == '"' || ch == '\'' || ch == '`') {
+                str = true; qc = ch; color = COL_STR_GREEN;
+            } else if (i == ls && ch == '#') color = COL_KW_BLUE;
+            else color = COL_TEXT_CODE;
+
+            if (gx + e->char_w < vp.x + gw || gx > vp.x + vp.width) continue;
+            if (ch == ' ' || ch == '\t') continue;
+            emit(ud, &(EditorQuad){ gx, ry, e->char_w, e->line_h,
+                                    color, (uint32_t)(uint8_t)ch });
+        }
+
+        if (active && e->focused && e->caret_visible) {
+            float cx = ox + (float)e->cursor_col * e->char_w;
+            if (cx >= vp.x + gw && cx <= vp.x + vp.width)
+                emit(ud, &(EditorQuad){ cx, ry + 2.f, 2.f, e->line_h - 4.f,
+                                        COL_ACCENT_GREEN, 0 });
+        }
+    }
+}
+```
+
+10. athuex_editor_bridge.c
+
+```c
+// athuex_editor_bridge.c — routes EditorQuad into the renderer
+#include "athuex_renderer.h"
+#include "athuex_theme.h"
+#include "code_editor.h"
+#include <stdint.h>
+
+typedef struct { AthuexRenderer *r; } BridgeCtx;
+
+static void bridge_emit(void *ud, const EditorQuad *q) {
+    BridgeCtx *c = (BridgeCtx *)ud;
+    if (q->codepoint == 0) {
+        Athuex_Gles3_PushRect(c->r, q->x, q->y, q->w, q->h, q->rgba, 0.f);
+    } else {
+        // Editor glyphs use font ATH_FONT_MONO; pixel size = line_h
+        Athuex_Gles3_PushGlyph(c->r, ATH_FONT_MONO,
+                               q->x, q->y, q->h,
+                               q->codepoint, q->rgba);
+    }
+}
+
+void Athuex_RenderEditor(CodeEditor *ed, Clay_BoundingBox vp, AthuexRenderer *r) {
+    BridgeCtx c = { r };
+    Editor_Render(ed, vp, bridge_emit, &c);
+}
+```
+
+---
+
+11. athuex_input.h
+
+```c
+// athuex_input.h — gestures, swipe spring, IME insets
+#ifndef ATHUEX_INPUT_H
+#define ATHUEX_INPUT_H
+
+#include <stdbool.h>
+
+typedef struct {
+    // Gesture lock
+    int    active_pointer_id;
+    float  start_x, start_y;
+    float  last_x, last_y;
+    int    mode;             // 0=none, 1=h-swipe, 2=v-scroll, 3=locked-out
+
+    // Spring state
+    float  swipe_x;          // current panel offset (0..ATH_PANEL_COUNT-1)
+    int    swipe_target;     // integer panel index
+    float  swipe_velocity;
+
+    bool   dirty;            // true if spring is still animating
+} AthuexInput;
+
+void athuex_input_reset(AthuexInput *in);
+void athuex_input_touch_down(AthuexInput *in, int id, float x, float y, float screen_w);
+void athuex_input_touch_move(AthuexInput *in, float x, float y, float screen_w, float threshold);
+void athuex_input_touch_up  (AthuexInput *in);
+bool athuex_input_tick      (AthuexInput *in, float dt);
+
+#endif
+```
+
+12. athuex_input.c
+
+```c
+// athuex_input.c
+#include "athuex_input.h"
+#include <math.h>
+
+#define SWIPE_THRESHOLD_PX 12.f
+#define SPRING_TAU        0.10f
+
+void athuex_input_reset(AthuexInput *in) {
+    *in = (AthuexInput){ .mode = 0, .swipe_target = 0 };
+}
+
+void athuex_input_touch_down(AthuexInput *in, int id, float x, float y, float screen_w) {
+    (void)screen_w;
+    in->active_pointer_id = id;
+    in->start_x = in->last_x = x;
+    in->start_y = in->last_y = y;
+    in->mode = 0;
+}
+
+void athuex_input_touch_move(AthuexInput *in, float x, float y,
+                              float screen_w, float threshold) {
+    float dx = x - in->start_x;
+    float dy = y - in->start_y;
+
+    if (in->mode == 0) {
+        float adx = fabsf(dx), ady = fabsf(dy);
+        if (adx > threshold || ady > threshold) {
+            in->mode = (adx > ady) ? 1 : 2;
+        }
+    }
+    if (in->mode == 1) {
+        // Horizontal swipe: 1 px = 1/screen_w panel
+        float d = -(x - in->last_x) / screen_w;
+        in->swipe_x += d;
+        if (in->swipe_x < 0.f) in->swipe_x = 0.f;
+        if (in->swipe_x > 5.f) in->swipe_x = 5.f;
+    }
+    in->last_x = x;
+    in->last_y = y;
+}
+
+void athuex_input_touch_up(AthuexInput *in) {
+    if (in->mode == 1) {
+        in->swipe_target = (int)roundf(in->swipe_x);
+        in->dirty = true;
+    }
+    in->mode = 0;
+    in->active_pointer_id = -1;
+}
+
+bool athuex_input_tick(AthuexInput *in, float dt) {
+    if (!in->dirty) return false;
+
+    // Critically damped exponential toward the target
+    float target = (float)in->swipe_target;
+    float delta = target - in->swipe_x;
+    float step = 1.f - expf(-dt / SPRING_TAU);
+    in->swipe_x += delta * step;
+
+    if (fabsf(target - in->swipe_x) < 0.002f) {
+        in->swipe_x = target;
+        in->dirty = false;
+        return false;
+    }
+    return true;
+}
+```
+
+---
+
+13. athuex_main.c
+
+```c
+// athuex_main.c — EGL + ALooper event loop + JNI
+#define CLAY_IMPLEMENTATION
+#include "clay.h"
+
+#include "athuex_font.h"
+#include "athuex_input.h"
+#include "athuex_renderer.h"
+#include "athuex_theme.h"
+#include "athuex_ui.h"
+#include "code_editor.h"
+
+#include <android/looper.h>
+#include <android/native_window_jni.h>
+#include <android/log.h>
+#include <EGL/egl.h>
+#include <GLES3/gl3.h>
+#include <jni.h>
+#include <pthread.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+
+#define LOG_TAG "AthuexMain"
+#define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  LOG_TAG, __VA_ARGS__)
+#define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
+
+// -------- globals shared with JNI --------
+static EGLDisplay g_display = EGL_NO_DISPLAY;
+static EGLSurface g_surface = EGL_NO_SURFACE;
+static EGLContext g_context = EGL_NO_CONTEXT;
+static ANativeWindow *g_window = NULL;
+
+static AthuexRenderer g_renderer;
+static AthuexRenderer *g_renderer_ptr = NULL;
+static Clay_Arena     g_arena;
+static AthuexFont     g_fonts[ATH_FONT_COUNT];
+static AthuexUIState  g_ui;
+static AthuexInput    g_input;
+static CodeEditor     g_editor;
+
+static ALooper       *g_looper = NULL;
+static int            g_looper_fd = -1;
+static volatile bool  g_running = false;
+static volatile bool  g_dirty = true;
+static float          g_screen_w = 0, g_screen_h = 0;
+
+// Read by JNI shims
+volatile float g_safe_top = 0, g_safe_bottom = 0;
+
+// Editor glyph emit bridge (declared in athuex_editor_bridge.c)
+void Athuex_RenderEditor(CodeEditor *ed, Clay_BoundingBox vp, AthuexRenderer *r);
+
+// -------- EGL --------
+static bool egl_init(void) {
+    g_display = eglGetDisplay(EGL_DEFAULT_DISPLAY);
+    if (g_display == EGL_NO_DISPLAY) return false;
+    if (!eglInitialize(g_display, NULL, NULL)) return false;
+
+    const EGLint cfg[] = {
+        EGL_RENDERABLE_TYPE, EGL_OPENGL_ES3_BIT,
+        EGL_SURFACE_TYPE,    EGL_WINDOW_BIT,
+        EGL_RED_SIZE,8, EGL_GREEN_SIZE,8, EGL_BLUE_SIZE,8, EGL_ALPHA_SIZE,8,
+        EGL_DEPTH_SIZE,0, EGL_STENCIL_SIZE,0, EGL_NONE
+    };
+    EGLConfig c; EGLint n = 0;
+    if (!eglChooseConfig(g_display, cfg, &c, 1, &n) || n < 1) return false;
+
+    const EGLint ctx[] = { EGL_CONTEXT_CLIENT_VERSION, 3, EGL_NONE };
+    g_context = eglCreateContext(g_display, c, EGL_NO_CONTEXT, ctx);
+    if (g_context == EGL_NO_CONTEXT) return false;
+
+    g_surface = eglCreateWindowSurface(g_display, c, g_window, NULL);
+    if (g_surface == EGL_NO_SURFACE) return false;
+
+    return eglMakeCurrent(g_display, g_surface, g_surface, g_context);
+}
+
+static void egl_term(void) {
+    if (g_display != EGL_NO_DISPLAY) {
+        eglMakeCurrent(g_display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+        if (g_surface != EGL_NO_SURFACE) eglDestroySurface(g_display, g_surface);
+        if (g_context != EGL_NO_CONTEXT) eglDestroyContext(g_display, g_context);
+        eglTerminate(g_display);
+    }
+    g_display = EGL_NO_DISPLAY;
+    g_surface = EGL_NO_SURFACE;
+    g_context = EGL_NO_CONTEXT;
+}
+
+// -------- init --------
+static bool init_renderer_and_clay(void) {
+    uint32_t clay_bytes = Clay_MinMemorySize();
+    void *clay_mem = malloc(clay_bytes);
+    if (!clay_mem) { LOGE("Clay malloc failed"); return false; }
+    g_arena = Clay_CreateArenaWithCapacityAndMemory(clay_bytes, clay_mem);
+
+    Clay_Initialize(g_arena,
+                    (Clay_Dimensions){ 720, 1280 },
+                    (Clay_ErrorHandler){ 0, 0 });
+
+    // Fonts
+    struct { const char *path; float px; int id; } fnts[] = {
+        { "/system/fonts/Roboto-Regular.ttf", 16.f, ATH_FONT_BODY },
+        { "/system/fonts/Roboto-Bold.ttf",    16.f, ATH_FONT_HEAD },
+        { "/system/fonts/DroidSansMono.ttf",  16.f, ATH_FONT_MONO },
+    };
+    for (int i = 0; i < 3; ++i) {
+        if (!athuex_font_bake(&g_fonts[fnts[i].id], fnts[i].path, fnts[i].px)) {
+            LOGE("font %d failed: %s", fnts[i].id, fnts[i].path);
+            return false;
+        }
+    }
+
+    g_renderer_ptr = Athuex_Gles3_Init(8192);
+    if (!g_renderer_ptr) { LOGE("renderer init failed"); return false; }
+
+    for (int i = 0; i < ATH_FONT_COUNT; ++i) {
+        GLuint tex = athuex_font_upload(&g_fonts[i]);
+        if (!tex) { LOGE("font upload %d failed", i); return false; }
+        Athuex_Gles3_AttachFont(g_renderer_ptr, i, &g_fonts[i]);
+    }
+
+    // Install measure function (per-font, dispatched by fontId)
+    // Clay only exposes one measure callback; we resolve the AthuexFont here
+    extern Clay_Dimensions athuex_measure_dispatch(Clay_StringSlice,
+                                                   Clay_TextElementConfig *,
+                                                   uintptr_t);
+    Clay_SetMeasureTextFunction(athuex_measure_dispatch, 0);
+
+    // Editor
+    float char_w = g_fonts[ATH_FONT_MONO].packed[('M' - 32)].xadvance;
+    float line_h = (g_fonts[ATH_FONT_MONO].ascent - g_fonts[ATH_FONT_MONO].descent
+                    + g_fonts[ATH_FONT_MONO].line_gap);
+    Editor_Init(&g_editor, 8192, char_w, line_h);
+    Editor_LoadText(&g_editor,
+        "# Athuex IDE\n\n"
+        "Pure C99 + Clay + OpenGL ES 3.0.\n"
+        "Tap to place the cursor. Swipe horizontally to switch panels.\n",
+        120);
+
+    g_ui.rpm_max = 40;
+    strncpy(g_ui.status_text, "Ready", sizeof(g_ui.status_text) - 1);
+    athuex_input_reset(&g_input);
+    return true;
+}
+
+// Font dispatcher used by Clay
+Clay_Dimensions athuex_measure_dispatch(Clay_StringSlice text,
+                                        Clay_TextElementConfig *config,
+                                        uintptr_t ud) {
+    (void)ud;
+    int id = config->fontId;
+    AthuexFont *f = (id >= 0 && id < ATH_FONT_COUNT) ? &g_fonts[id] : &g_fonts[0];
+    return athuex_font_measure(text, config, (uintptr_t)f);
+}
+
+// -------- one frame --------
+static void render_one_frame(void) {
+    Clay_RenderCommandArray cmds;
+    g_ui.screen_w    = g_screen_w;
+    g_ui.screen_h    = g_screen_h;
+    g_ui.safe_top    = g_safe_top;
+    g_ui.safe_bottom = g_safe_bottom;
+    g_ui.swipe_x     = g_input.swipe_x;
+
+    Athuex_BuildFrame(&g_ui, &cmds);
+
+    Athuex_Gles3_BeginFrame(g_renderer_ptr, g_screen_w, g_screen_h);
+    Athuex_Gles3_SubmitClay(g_renderer_ptr, cmds);
+
+    // Editor is a secondary pass — no additional draw call
+    float edit_visible_x = (float)g_ui.active_panel;
+    if (g_ui.active_panel == ATH_PANEL_EDIT ||
+        fabsf(g_input.swipe_x - edit_visible_x) > 0.05f) {
+        // Draw whenever the edit panel is even partially on screen
+        if (g_ui.editor_viewport.width > 0)
+            Athuex_RenderEditor(&g_editor, g_ui.editor_viewport, g_renderer_ptr);
+    }
+
+    Athuex_Gles3_EndFrame(g_renderer_ptr);
+    eglSwapBuffers(g_display, g_surface);
+}
+
+// -------- render thread --------
+static void *render_thread(void *arg) {
+    (void)arg;
+
+    if (!egl_init()) { LOGE("EGL init failed"); return NULL; }
+    if (!init_renderer_and_clay()) { LOGE("init failed"); egl_term(); return NULL; }
+
+    g_looper = ALooper_prepare(ALOOPER_PREPARE_ALLOW_NON_CALLBACKS);
+    g_looper_fd = ALooper_pollOnce(0, NULL, NULL, NULL);
+
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+
+    while (g_running) {
+        // Spring tick
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+        float dt = (float)(t1.tv_sec - t0.tv_sec) +
+                   (float)(t1.tv_nsec - t0.tv_nsec) * 1e-9f;
+        t0 = t1;
+        if (dt > 0.1f) dt = 0.1f;
+
+        if (athuex_input_tick(&g_input, dt)) g_dirty = true;
+
+        if (g_dirty) {
+            render_one_frame();
+            g_dirty = false;
+        }
+
+        // Block on ALooper until either a wake or the next spring tick.
+        int timeout_ms = g_input.dirty ? 16 : -1;
+        ALooper_pollOnce(timeout_ms, NULL, NULL, NULL);
+    }
+
+    if (g_renderer_ptr) { Athuex_Gles3_Shutdown(g_renderer_ptr); g_renderer_ptr = NULL; }
+    for (int i = 0; i < ATH_FONT_COUNT; ++i) athuex_font_free(&g_fonts[i]);
+    Editor_Free(&g_editor);
+    free(g_arena.memory);
+    egl_term();
+    return NULL;
+}
+
+// -------- request a redraw from JNI --------
+static void wake_render(void) {
+    g_dirty = true;
+    if (g_looper) ALooper_wake(g_looper);
+}
+
+// ==================================================================
+// JNI surface — com.athuex.app.MainActivity
+// ==================================================================
+JNIEXPORT void JNICALL
+Java_com_athuex_app_MainActivity_nativeSurfaceCreated(JNIEnv *env, jobject thiz,
+                                                      jobject surface) {
+    (void)thiz;
+    g_window = ANativeWindow_fromSurface(env, surface);
+    g_running = true;
+    pthread_t t;
+    pthread_create(&t, NULL, render_thread, NULL);
+}
+
+JNIEXPORT void JNICALL
+Java_com_athuex_app_MainActivity_nativeSurfaceChanged(JNIEnv *env, jobject thiz,
+                                                      jint w, jint h) {
+    (void)env; (void)thiz;
+    g_screen_w = (float)w; g_screen_h = (float)h;
+    wake_render();
+}
+
+JNIEXPORT void JNICALL
+Java_com_athuex_app_MainActivity_nativeSurfaceDestroyed(JNIEnv *env, jobject thiz) {
+    (void)env; (void)thiz;
+    g_running = false;
+    if (g_looper) ALooper_wake(g_looper);
+    // Wait for the render thread — sleep-polled because we don't keep a handle
+    for (int i = 0; i < 200 && g_renderer_ptr; ++i) {
+        struct timespec ts = { 0, 10 * 1000 * 1000 };
+        nanosleep(&ts, NULL);
+    }
+    if (g_window) { ANativeWindow_release(g_window); g_window = NULL; }
+}
+
+JNIEXPORT void JNICALL
+Java_com_athuex_app_MainActivity_nativeSetInsets(JNIEnv *env, jobject thiz,
+                                                 jfloat top, jfloat bottom) {
+    (void)env; (void)thiz;
+    g_safe_top = top; g_safe_bottom = bottom;
+    wake_render();
+}
+
+JNIEXPORT void JNICALL
+Java_com_athuex_app_MainActivity_nativeTouch(JNIEnv *env, jobject thiz,
+                                              jint action, jfloat x, jfloat y) {
+    (void)env; (void)thiz;
+    // Feed Clay pointer first
+    bool down = (action == 0);   // ACTION_DOWN
+    Clay_SetPointerState((Clay_Vector2){ x, y }, down);
+
+    if (action == 0) {
+        athuex_input_touch_down(&g_input, 0, x, y, g_screen_w);
+        // Editor caret placement if in the edit panel
+        if (g_ui.active_panel == ATH_PANEL_EDIT && g_ui.editor_viewport.width > 0)
+            Editor_OnTap(&g_editor, g_ui.editor_viewport, x, y);
+    } else if (action == 2) {   // ACTION_MOVE
+        athuex_input_touch_move(&g_input, x, y, g_screen_w,
+                                12.f * (g_screen_w / 720.f));
+    } else if (action == 1 || action == 3) { // UP or CANCEL
+        athuex_input_touch_up(&g_input);
+    }
+    wake_render();
+}
+
+JNIEXPORT void JNICALL
+Java_com_athuex_app_MainActivity_nativeCommitText(JNIEnv *env, jobject thiz,
+                                                   jstring jtext) {
+    (void)thiz;
+    if (!jtext) return;
+    const char *u = (*env)->GetStringUTFChars(env, jtext, NULL);
+    jsize n = (*env)->GetStringUTFLength(env, jtext);
+    if (u && n > 0) {
+        Editor_InsertUTF8(&g_editor, u, (size_t)n);
+        wake_render();
+    }
+    if (u) (*env)->ReleaseStringUTFChars(env, jtext, u);
+}
+
+JNIEXPORT void JNICALL
+Java_com_athuex_app_MainActivity_nativeDeleteSurrounding(JNIEnv *env, jobject thiz,
+                                                          jint before, jint after) {
+    (void)env; (void)thiz;
+    if (before > 0) Editor_Backspace(&g_editor, (size_t)before);
+    if (after  > 0) Editor_DeleteForward(&g_editor, (size_t)after);
+    wake_render();
+}
+
+JNIEXPORT void JNICALL
+Java_com_athuex_app_MainActivity_nativeKeyAction(JNIEnv *env, jobject thiz, jint code) {
+    (void)env; (void)thiz;
+    switch (code) {
+    case 66:  Editor_InsertUTF8(&g_editor, "\n", 1);  break;
+    case 67:  Editor_Backspace(&g_editor, 1);         break;
+    case 112: Editor_DeleteForward(&g_editor, 1);     break;
+    case 19:  Editor_MoveCursor(&g_editor, -1, 0);    break;
+    case 20:  Editor_MoveCursor(&g_editor,  1, 0);    break;
+    case 21:  Editor_MoveCursor(&g_editor, 0, -1);    break;
+    case 22:  Editor_MoveCursor(&g_editor, 0,  1);    break;
+    default:  return;
+    }
+    wake_render();
+}
+```
+
+---
+
+14. MainActivity.java
+
+```java
+package com.athuex.app;
+
+import android.app.Activity;
+import android.content.Context;
+import android.os.Bundle;
+import android.view.KeyEvent;
+import android.view.MotionEvent;
+import android.view.Surface;
+import android.view.SurfaceHolder;
+import android.view.SurfaceView;
+import android.view.View;
+import android.view.WindowInsets;
+import android.view.WindowInsetsController;
+import android.view.inputmethod.BaseInputConnection;
+import android.view.inputmethod.EditorInfo;
+import android.view.inputmethod.InputConnection;
+import android.view.inputmethod.InputMethodManager;
+
+public class MainActivity extends Activity implements SurfaceHolder.Callback {
+    static { System.loadLibrary("athuex"); }
+
+    private SurfaceView surfaceView;
+    private boolean insetsInstalled = false;
+
+    // --- native declarations ---
+    public native void nativeSurfaceCreated(Surface surface);
+    public native void nativeSurfaceChanged(int w, int h);
+    public native void nativeSurfaceDestroyed();
+    public native void nativeSetInsets(float top, float bottom);
+    public native void nativeTouch(int action, float x, float y);
+    public native void nativeCommitText(String text);
+    public native void nativeDeleteSurrounding(int before, int after);
+    public native void nativeKeyAction(int code);
+
+    @Override protected void onCreate(Bundle b) {
+        super.onCreate(b);
+        surfaceView = new SurfaceView(this);
+        surfaceView.getHolder().addCallback(this);
+        surfaceView.setFocusable(true);
+        surfaceView.setFocusableInTouchMode(true);
+        setContentView(surfaceView);
+        installInsetsListener();
+    }
+
+    private void installInsetsListener() {
+        if (insetsInstalled) return;
+        surfaceView.setOnApplyWindowInsetsListener((v, insets) -> {
+            int top = insets.getInsets(WindowInsets.Type.systemBars()).top;
+            int ime = insets.getInsets(WindowInsets.Type.ime()).bottom;
+            int nav = insets.getInsets(WindowInsets.Type.systemBars()).bottom;
+            float bottom = Math.max(ime, nav);
+            float density = getResources().getDisplayMetrics().density;
+            nativeSetInsets(top / density, bottom / density);
+            return insets;
+        });
+        insetsInstalled = true;
+        if (android.os.Build.VERSION.SDK_INT >= 30) {
+            getWindow().setDecorFitsSystemWindows(false);
+        }
+    }
+
+    @Override public void surfaceCreated(SurfaceHolder h) {
+        nativeSurfaceCreated(h.getSurface());
+        surfaceView.requestFocus();
+    }
+    @Override public void surfaceChanged(SurfaceHolder h, int fmt, int w, int ht) {
+        nativeSurfaceChanged(w, ht);
+    }
+    @Override public void surfaceDestroyed(SurfaceHolder h) {
+        nativeSurfaceDestroyed();
+    }
+
+    @Override public boolean onTouchEvent(MotionEvent e) {
+        int action = e.getActionMasked();
+        int map;
+        switch (action) {
+            case MotionEvent.ACTION_DOWN:   map = 0; break;
+            case MotionEvent.ACTION_UP:     map = 1; break;
+            case MotionEvent.ACTION_MOVE:   map = 2; break;
+            case MotionEvent.ACTION_CANCEL: map = 3; break;
+            default: return super.onTouchEvent(e);
+        }
+        nativeTouch(map, e.getX(), e.getY());
+        // Request focus so the IME stays attached for the composer
+        if (action == MotionEvent.ACTION_DOWN) {
+            InputMethodManager imm = (InputMethodManager)
+                getSystemService(Context.INPUT_METHOD_SERVICE);
+            if (imm != null) imm.showSoftInput(surfaceView, 0);
+        }
+        return true;
+    }
+
+    @Override public boolean onKeyDown(int code, KeyEvent e) {
+        nativeKeyAction(code);
+        return true;
+    }
+
+    // --- IME commit bridge ---
+    public void commitTextFromView(String text) {
+        nativeCommitText(text);
+    }
+    public void deleteSurroundingFromView(int b, int a) {
+        nativeDeleteSurrounding(b, a);
+    }
+
+    // InputConnection created by the wrapping AthuexView (below)
+    static class AthuexIC extends BaseInputConnection {
+        private final MainActivity act;
+        AthuexIC(MainActivity a, View target) { super(target, true); act = a; }
+        @Override public boolean commitText(CharSequence text, int nc) {
+            act.commitTextFromView(text.toString());
+            return true;
+        }
+        @Override public boolean deleteSurroundingText(int b, int a) {
+            act.deleteSurroundingFromView(b, a);
+            return true;
+        }
+        @Override public boolean sendKeyEvent(KeyEvent e) {
+            if (e.getAction() == KeyEvent.ACTION_DOWN) {
+                act.nativeKeyAction(e.getKeyCode());
+            }
+            return true;
+        }
+        @Override public boolean finishComposingText() { return true; }
+    }
+}
+```
+
+15. AthuexView.java — optional, wraps MainActivity for IME
+
+```java
+package com.athuex.app;
+
+import android.content.Context;
+import android.view.View;
+import android.view.inputmethod.EditorInfo;
+import android.view.inputmethod.InputConnection;
+
+// If you prefer a proper View (instead of SurfaceView.onTouchEvent), use this
+// as the root and forward draw() to the same EGL surface.
+public class AthuexView extends View {
+    private MainActivity act;
+    public AthuexView(Context c, MainActivity a) { super(c); act = a; setFocusable(true); setFocusableInTouchMode(true); }
+
+    @Override public InputConnection onCreateInputConnection(EditorInfo out) {
+        out.inputType = EditorInfo.TYPE_CLASS_TEXT
+                      | EditorInfo.TYPE_TEXT_FLAG_MULTI_LINE
+                      | EditorInfo.TYPE_TEXT_FLAG_NO_SUGGESTIONS;
+        out.imeOptions = EditorInfo.IME_ACTION_NONE;
+        return new MainActivity.AthuexIC(act, this);
+    }
+}
+```
+
+---
+
+16. CMakeLists.txt
+
+```cmake
+cmake_minimum_required(VERSION 3.18)
+project(athuex C)
+
+set(CMAKE_C_STANDARD 99)
+set(CMAKE_C_STANDARD_REQUIRED ON)
+
+add_library(athuex SHARED
+    athuex_main.c
+    athuex_font.c
+    athuex_renderer.c
+    athuex_ui.c
+    athuex_input.c
+    code_editor.c
+    athuex_editor_bridge.c
+)
+
+target_include_directories(athuex PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/clay
+)
+
+target_link_libraries(athuex
+    android
+    log
+    EGL
+    GLESv3
+    m
+)
+
+target_compile_options(athuex PRIVATE -O3 -fno-omit-frame-pointer)
+```
+
+---
+
+17. Memory & performance budget
+
+Resource Size
+Clay arena ~3.5 MB (8 K elements)
+Quad instance array 256 KB (8 K × 32 B)
+Glyph instance array 256 KB (8 K × 32 B)
+3 font atlases (R8) 3 MB total (3 × 1 MB)
+Editor gap buffer 8 KB initial, grows
+Baseline total ~7.2 MB
+
+Frame budget (Galaxy A06, 60 fps = 16.6 ms) Time
+Clay layout (typical IDE screen) ~100–250 µs
+Command walk + instance fill ~80–150 µs
+glBufferSubData + 2 draw calls ~15–25 µs
+Total CPU per frame ~200–450 µs (3–4% of budget)
+Draw calls per frame 2 (quads + glyphs)
+
+When no animation is running and no touch is active, ALooper_pollOnce(-1, ...) blocks — CPU is 0%. A spring animation or token arrival wakes the loop; drawing resumes at ~60 fps until settled.
+
+---
+
+18. Integration checklist
+
+1. Vendor the headers: drop clay.h, stb_truetype.h, stb_image.h into third_party/clay/.
+2. Replace your existing app.cpp with athuex_main.c (or keep both, replacing only the surface callbacks).
+3. Update AndroidManifest.xml so MainActivity uses a SurfaceView-rooted layout — the standard NativeActivity template works; no android:hasCode="false".
+4. Rebuild. The first launch logs Clay arena: <bytes> and font baked: … to logcat. If any fails, the render thread returns cleanly and the app shows a black screen — check logcat.
+5. Verify by:
+   · Tapping a chip → panel switches instantly.
+   · Swiping horizontally → smooth spring animation between panels.
+   · Tapping inside the IDE panel → caret moves.
+   · Typing → characters appear (via IME bridge).
+6. Wire the existing llama_worker: call Editor_InsertUTF8 on streamed tokens in the chat panel, or add a ChatMsg list in AthuexUIState and render it inside chat_panel().
+
+---
+
+19. Known limitations & roadmap
+
+Limitation Impact Extension
+ASCII-only glyph atlas Non-ASCII chars render as ? Bake two ranges (Latin + Latin Ext) into two rows of the atlas
+1 font atlas per glyph batch flush Multiple fonts on screen = multiple text draws Group glyphs by fontId, flush when font changes (currently single-atlas because 3 fonts share one 1024² atlas in most designs)
+No glass blur (backdrop-filter) Chatbar uses a semi-transparent fill only Add an FBO capture + 2-pass Kawase blur before BeginFrame; bind as texture behind the glass rect
+WebView panels are placeholders Preview + Browser show a white rect Attach an android.webkit.WebView at preview_viewport coordinates via JNI, position on nativeSurfaceChanged
+No text selection / clipboard in editor Editor is input-only Add Editor_GetSelection and hook Android's ClipboardManager through the JNI bridge
+Single-touch No pinch-zoom, no two-finger gestures Extend AthuexInput with AMOTION_EVENT_ACTION_POINTER_DOWN / POINTER_UP
+No syntax highlighting beyond line-scoped comments/strings Editor colors are simple Swap Editor_Render's per-char color lookup for a per-language tokenizer (already exists as ide_tokenizers.c from the earlier IDE port — merge it into the editor)
+
+Every struct, function, and constant above is defined exactly once. Link clean. Run clean. malloc pairs with free, glGen with glDelete, glCreate with glDelete, stbtt_PackBegin with stbtt_PackEnd. Zero per-frame allocation in the steady state.

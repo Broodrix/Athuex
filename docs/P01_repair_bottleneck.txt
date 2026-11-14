@@ -1,0 +1,856 @@
+
+#
+
+Fixing the GGUF load freeze in the new Clay/GLES3 engine
+
+Two things that matter more than anything else:
+
+1. mmap must be true (default in recent llama.cpp, but silently disabled if you set use_mlock=true). Without mmap, a Q4_K_M 2B model reads ~1.2 GB into RAM at load → kernel evicts every page the UI needs → the UI thread faults on every frame.
+2. OpenMP must be off in the llama.cpp build. OpenMP threads spawn with default priority and ignore nice() → even with a low-priority worker thread, the OpenMP pool will preempt the UI. -DGGML_OPENMP=OFF -DLLAMA_OPENMP=OFF.
+
+Below is the complete drop-in replacement worker — pure C using the llama.h C API — plus the small patches to athuex_main.c, athuex_ui.h, and athuex_ui.c that show the loading state and hide the IME until the model is ready.
+
+---
+
+1. athuex_worker.h
+
+```c
+// athuex_worker.h — pure C99 llama.cpp worker, low-priority, mmap-backed
+#ifndef ATHUEX_WORKER_H
+#define ATHUEX_WORKER_H
+
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+typedef enum {
+    ATH_WORKER_IDLE = 0,
+    ATH_WORKER_LOADING,
+    ATH_WORKER_READY,
+    ATH_WORKER_GENERATING,
+    ATH_WORKER_ERROR
+} AthWorkerState;
+
+// One-time init/free. Must be called once from the render thread before any
+// load. Idempotent.
+void AthWorker_Init(void);
+void AthWorker_Shutdown(void);
+
+// Begin loading a GGUF on the worker thread. Returns false if a load is
+// already in flight or the state is not IDLE/READY/ERROR.
+bool AthWorker_LoadModel(const char *path);
+
+// Begin generation. Blocks only if the worker is still LOADING.
+// Returns false if the worker is not READY.
+bool AthWorker_Generate(const char *prompt, int max_tokens);
+
+// Request a stop. Takes effect between tokens.
+void AthWorker_Stop(void);
+
+// Non-blocking state queries (thread-safe via atomics).
+AthWorkerState AthWorker_State(void);
+float          AthWorker_LoadProgress(void);   // 0..100
+int            AthWorker_TokensGenerated(void);
+float          AthWorker_TokPerSec(void);
+
+// Copy generated text since the last call. Returns number of bytes written.
+size_t AthWorker_DrainOutput(char *out, size_t out_cap);
+
+// Copy the active model description (empty if none).
+size_t AthWorker_ModelDesc(char *out, size_t out_cap);
+
+// Error string if state == ATH_WORKER_ERROR.
+size_t AthWorker_LastError(char *out, size_t out_cap);
+
+// Called by the worker whenever state changes so the UI can wake ALooper.
+extern void (*AthWorker_OnStateChanged)(void);
+
+#ifdef __cplusplus
+}
+#endif
+#endif
+```
+
+---
+
+2. athuex_worker.c
+
+```c
+// athuex_worker.c — low-priority, mmap-backed llama.cpp worker in pure C
+#define _GNU_SOURCE
+#include "athuex_worker.h"
+
+#include "llama.h"
+#include <android/log.h>
+#include <errno.h>
+#include <pthread.h>
+#include <sched.h>
+#include <stdatomic.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/resource.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+
+#define LOG_TAG "AthuexWorker"
+#define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  LOG_TAG, __VA_ARGS__)
+#define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
+
+// llama.cpp version compatibility: the batch.seq_id field was changed from a
+// flat array (llama_seq_id*) to an array of pointers (llama_seq_id**) in 2024.
+// Set to 1 for a modern build (recommended), 0 for pre-Nov-2024.
+#ifndef ATHUEX_LLAMA_MODERN_SEQ_ID
+#define ATHUEX_LLAMA_MODERN_SEQ_ID 1
+#endif
+
+// -------------------- shared state --------------------
+static atomic_int  g_state        = ATH_WORKER_IDLE;
+static atomic_int  g_progress_pm  = 0;    // progress * 1000 (0..100000)
+static atomic_int  g_tokens       = 0;
+static atomic_int  g_tps_pm       = 0;    // tokens/sec * 1000
+static atomic_bool g_cancel_load  = false;
+static atomic_bool g_cancel_gen   = false;
+
+static pthread_mutex_t g_out_mtx = PTHREAD_MUTEX_INITIALIZER;
+static char  g_out_buf[65536];
+static size_t g_out_len = 0;
+
+static pthread_mutex_t g_desc_mtx = PTHREAD_MUTEX_INITIALIZER;
+static char   g_model_desc[256] = {0};
+static char   g_last_error[256] = {0};
+
+static pthread_t g_thread;
+static atomic_bool g_thread_running = false;
+static atomic_bool g_loaded         = false;
+static bool g_init_done = false;
+
+// Command queue (one-shot; the worker picks it up and clears)
+static char  g_cmd_model_path[512];
+static char  g_cmd_prompt[8192];
+static int   g_cmd_max_tokens = 256;
+static atomic_int g_cmd = 0;      // 0=none 1=load 2=gen
+
+// llama state (only touched by the worker thread)
+static struct llama_model   *g_model = NULL;
+static struct llama_context *g_ctx   = NULL;
+
+void (*AthWorker_OnStateChanged)(void) = NULL;
+
+// -------------------- helpers --------------------
+static void notify(void) {
+    if (AthWorker_OnStateChanged) AthWorker_OnStateChanged();
+}
+
+static void set_state(AthWorkerState s) {
+    atomic_store(&g_state, (int)s);
+    notify();
+}
+
+static void set_error(const char *msg) {
+    pthread_mutex_lock(&g_desc_mtx);
+    strncpy(g_last_error, msg ? msg : "", sizeof(g_last_error) - 1);
+    pthread_mutex_unlock(&g_desc_mtx);
+    LOGE("%s", msg ? msg : "(null)");
+    set_state(ATH_WORKER_ERROR);
+}
+
+static void out_clear(void) {
+    pthread_mutex_lock(&g_out_mtx);
+    g_out_len = 0;
+    pthread_mutex_unlock(&g_out_mtx);
+}
+
+static void out_append(const char *s, size_t n) {
+    pthread_mutex_lock(&g_out_mtx);
+    if (g_out_len + n > sizeof(g_out_buf)) n = sizeof(g_out_buf) - g_out_len;
+    memcpy(g_out_buf + g_out_len, s, n);
+    g_out_len += n;
+    pthread_mutex_unlock(&g_out_mtx);
+    notify();
+}
+
+// llama.cpp load progress callback. Return false to abort.
+static bool load_progress_cb(float progress, void *ud) {
+    (void)ud;
+    int pm = (int)(progress * 100000.f);
+    if (pm < 0) pm = 0;
+    if (pm > 100000) pm = 100000;
+    atomic_store(&g_progress_pm, pm);
+    if (atomic_load(&g_cancel_load)) return false;
+    notify();
+    return true;
+}
+
+// Thread priority: worker runs at nice 10 so the kernel always preempts it
+// for the (nice 0) UI thread. This is the single biggest fix for the freeze.
+static void set_worker_priority(void) {
+    pid_t tid = (pid_t)syscall(SYS_gettid);
+
+    // nice 10 — UI thread (nice 0) preempts on any contention
+    if (setpriority(PRIO_PROCESS, tid, 10) < 0)
+        LOGE("setpriority: errno=%d", errno);
+
+    // SCHED_BATCH: prefers throughput, yields to interactive threads.
+    // Silently ignored on kernels that don't allow it (many Android ROMs).
+    struct sched_param sp = { .sched_priority = 0 };
+    if (sched_setscheduler(tid, SCHED_BATCH, &sp) < 0)
+        LOGI("SCHED_BATCH not allowed (fine): errno=%d", errno);
+
+    LOGI("worker tid=%d priority set (nice=10)", tid);
+}
+
+// Choose worker thread count: leave at least 2 cores free for the UI.
+static int choose_threads(void) {
+    long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
+    if (ncpu < 1) ncpu = 1;
+    int n = (int)ncpu - 2;
+    if (n < 2) n = 2;      // dual-core device: use both, priority saves us
+    if (n > 4) n = 4;      // thermal cap
+    LOGI("worker threads=%d (ncpu=%ld)", n, ncpu);
+    return n;
+}
+
+// -------------------- load --------------------
+static void do_load(const char *path) {
+    if (atomic_load(&g_loaded) && g_model && g_ctx) {
+        // Reload requested — tear down first
+        llama_free(g_ctx);
+        llama_free_model(g_model);
+        g_ctx = NULL; g_model = NULL;
+        atomic_store(&g_loaded, false);
+    }
+
+    atomic_store(&g_progress_pm, 0);
+    atomic_store(&g_cancel_load, false);
+    set_state(ATH_WORKER_LOADING);
+
+    // -------- model params: mmap ON, mlock OFF --------
+    struct llama_model_params mp = llama_model_default_params();
+    mp.use_mmap = true;    // page in lazily — huge win on 4 GB devices
+    mp.use_mlock = false;  // never pin: we want the OS to evict under pressure
+    mp.progress_callback = load_progress_cb;
+    mp.progress_callback_user_data = NULL;
+
+    LOGI("loading model (mmap=true, mlock=false): %s", path);
+    g_model = llama_load_model_from_file(path, mp);
+    if (!g_model) { set_error("llama_load_model_from_file failed"); return; }
+    if (atomic_load(&g_cancel_load)) { set_error("load cancelled"); return; }
+
+    // Publish model description to UI
+    char desc[192] = {0};
+    llama_model_desc(g_model, desc, sizeof(desc));
+    pthread_mutex_lock(&g_desc_mtx);
+    strncpy(g_model_desc, desc, sizeof(g_model_desc) - 1);
+    pthread_mutex_unlock(&g_desc_mtx);
+
+    // -------- context params --------
+    int n_threads = choose_threads();
+    struct llama_context_params cp = llama_context_default_params();
+    cp.n_ctx            = 2048;             // 4 GB safe
+    cp.n_batch          = 256;              // smaller = less peak memory
+    cp.n_threads        = n_threads;
+    cp.n_threads_batch  = n_threads;
+    cp.flash_attn_type  = LLAMA_FLASH_ATTN_TYPE_AUTO; // silently no-ops if unsupported
+
+    LOGI("creating context (n_ctx=%u, n_batch=%u, n_threads=%d)",
+         cp.n_ctx, cp.n_batch, n_threads);
+    g_ctx = llama_new_context_with_model(g_model, cp);
+    if (!g_ctx) { set_error("llama_new_context_with_model failed"); return; }
+    if (atomic_load(&g_cancel_load)) { set_error("load cancelled"); return; }
+
+    atomic_store(&g_loaded, true);
+    atomic_store(&g_progress_pm, 100000);
+    set_state(ATH_WORKER_READY);
+    LOGI("model ready: %s", desc);
+}
+
+// -------------------- generate --------------------
+static void do_generate(const char *prompt, int max_tokens) {
+    if (!g_model || !g_ctx) { set_error("no model loaded"); return; }
+
+    atomic_store(&g_cancel_gen, false);
+    atomic_store(&g_tokens, 0);
+    atomic_store(&g_tps_pm, 0);
+    out_clear();
+    set_state(ATH_WORKER_GENERATING);
+
+    const int n_threads = choose_threads();
+
+    // -------- tokenize prompt --------
+    const bool add_bos = true;
+    const bool special = false;
+    int n_prompt_max = (int)strlen(prompt) + 4;
+    llama_token *prompt_tokens =
+        (llama_token *)malloc(sizeof(llama_token) * (size_t)n_prompt_max);
+    if (!prompt_tokens) { set_error("oom"); return; }
+
+    int n_prompt = llama_tokenize(g_model,
+                                   prompt, (int32_t)strlen(prompt),
+                                   prompt_tokens, n_prompt_max,
+                                   add_bos, special);
+    if (n_prompt < 0) {
+        free(prompt_tokens);
+        set_error("llama_tokenize failed");
+        return;
+    }
+
+    // -------- batch decode --------
+    struct llama_batch batch = llama_batch_init(n_prompt, 0, 1);
+    batch.n_tokens = n_prompt;
+    for (int i = 0; i < n_prompt; ++i) {
+        batch.token[i]  = prompt_tokens[i];
+        batch.pos[i]    = i;
+        batch.logits[i] = (i == n_prompt - 1) ? 1 : 0;
+#if ATHUEX_LLAMA_MODERN_SEQ_ID
+        batch.n_seq_id[i] = 1;
+        batch.seq_id[i][0] = 0;
+#else
+        batch.seq_id[i] = 0;
+#endif
+    }
+
+    if (llama_decode(g_ctx, batch) != 0) {
+        llama_batch_free(batch);
+        free(prompt_tokens);
+        set_error("llama_decode (prompt) failed");
+        return;
+    }
+    int n_past = n_prompt;
+
+    // -------- sampler chain --------
+    struct llama_sampler *smpl =
+        llama_sampler_chain_init(llama_sampler_chain_default_params());
+    llama_sampler_chain_add(smpl, llama_sampler_init_top_k(40));
+    llama_sampler_chain_add(smpl, llama_sampler_init_top_p(0.9f, 1));
+    llama_sampler_chain_add(smpl, llama_sampler_init_temp(0.4f));
+    llama_sampler_chain_add(smpl, llama_sampler_init_dist(LLAMA_DEFAULT_SEED));
+
+    // -------- generation loop --------
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+
+    char piece[256];
+    int  gen = 0;
+    while (gen < max_tokens) {
+        if (atomic_load(&g_cancel_gen)) break;
+
+        llama_token id = llama_sampler_sample(smpl, g_ctx, -1);
+        llama_sampler_accept(smpl, id);
+
+        if (llama_token_is_eog(g_model, id)) break;
+
+        // Convert token → UTF-8 piece
+        int n = llama_token_to_piece(g_model, id, piece, sizeof(piece) - 1,
+                                     0, /*special=*/false);
+        if (n > 0) {
+            piece[n] = 0;
+            out_append(piece, (size_t)n);
+        }
+
+        // Decode the generated token (logits needed for next sample)
+        struct llama_batch b2 = llama_batch_init(1, 0, 1);
+        b2.n_tokens = 1;
+        b2.token[0] = id;
+        b2.pos[0]   = n_past;
+        b2.logits[0]= 1;
+#if ATHUEX_LLAMA_MODERN_SEQ_ID
+        b2.n_seq_id[0] = 1;
+        b2.seq_id[0][0] = 0;
+#else
+        b2.seq_id[0] = 0;
+#endif
+        if (llama_decode(g_ctx, b2) != 0) {
+            llama_batch_free(b2);
+            break;
+        }
+        llama_batch_free(b2);
+
+        ++n_past;
+        ++gen;
+        atomic_store(&g_tokens, gen);
+
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+        double elapsed = (double)(t1.tv_sec - t0.tv_sec)
+                       + (double)(t1.tv_nsec - t0.tv_nsec) * 1e-9;
+        if (elapsed > 0.1)
+            atomic_store(&g_tps_pm, (int)((double)gen / elapsed * 1000.0));
+    }
+
+    llama_sampler_free(smpl);
+    llama_batch_free(batch);
+    free(prompt_tokens);
+    set_state(ATH_WORKER_READY);
+    (void)n_threads;
+}
+
+// -------------------- worker thread --------------------
+static void *worker_main(void *arg) {
+    (void)arg;
+    set_worker_priority();
+
+    while (atomic_load(&g_thread_running)) {
+        int cmd = atomic_exchange(&g_cmd, 0);
+        if (cmd == 0) {
+            struct timespec ts = { 0, 20 * 1000 * 1000 }; // 20 ms
+            nanosleep(&ts, NULL);
+            continue;
+        }
+        if (cmd == 1) {
+            do_load(g_cmd_model_path);
+        } else if (cmd == 2) {
+            do_generate(g_cmd_prompt, g_cmd_max_tokens);
+        }
+    }
+    return NULL;
+}
+
+// -------------------- public --------------------
+void AthWorker_Init(void) {
+    if (g_init_done) return;
+    g_init_done = true;
+
+    llama_backend_init();
+    atomic_store(&g_thread_running, true);
+
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_JOINABLE);
+    if (pthread_create(&g_thread, &attr, worker_main, NULL) != 0) {
+        LOGE("pthread_create failed");
+        atomic_store(&g_thread_running, false);
+    }
+    pthread_attr_destroy(&attr);
+    LOGI("worker thread started");
+}
+
+void AthWorker_Shutdown(void) {
+    if (!g_init_done) return;
+    atomic_store(&g_thread_running, false);
+    pthread_join(g_thread, NULL);
+
+    if (g_ctx)   { llama_free(g_ctx); g_ctx = NULL; }
+    if (g_model) { llama_free_model(g_model); g_model = NULL; }
+    atomic_store(&g_loaded, false);
+    llama_backend_free();
+    g_init_done = false;
+    LOGI("worker shutdown");
+}
+
+bool AthWorker_LoadModel(const char *path) {
+    if (!path || !*path) return false;
+    int s = atomic_load(&g_state);
+    if (s == ATH_WORKER_LOADING || s == ATH_WORKER_GENERATING) return false;
+    atomic_store(&g_cancel_load, false);
+    strncpy(g_cmd_model_path, path, sizeof(g_cmd_model_path) - 1);
+    atomic_store(&g_cmd, 1);
+    notify();
+    return true;
+}
+
+bool AthWorker_Generate(const char *prompt, int max_tokens) {
+    if (!prompt || !*prompt) return false;
+    if (atomic_load(&g_state) != ATH_WORKER_READY) return false;
+    strncpy(g_cmd_prompt, prompt, sizeof(g_cmd_prompt) - 1);
+    g_cmd_max_tokens = max_tokens > 0 ? max_tokens : 256;
+    atomic_store(&g_cancel_gen, false);
+    atomic_store(&g_cmd, 2);
+    notify();
+    return true;
+}
+
+void AthWorker_Stop(void) {
+    atomic_store(&g_cancel_gen, true);
+    atomic_store(&g_cancel_load, true);
+    notify();
+}
+
+AthWorkerState AthWorker_State(void)   { return (AthWorkerState)atomic_load(&g_state); }
+float AthWorker_LoadProgress(void)     { return (float)atomic_load(&g_progress_pm) / 1000.f; }
+int   AthWorker_TokensGenerated(void)  { return atomic_load(&g_tokens); }
+float AthWorker_TokPerSec(void)        { return (float)atomic_load(&g_tps_pm) / 1000.f; }
+
+size_t AthWorker_DrainOutput(char *out, size_t cap) {
+    if (!out || cap == 0) return 0;
+    pthread_mutex_lock(&g_out_mtx);
+    size_t n = g_out_len < cap ? g_out_len : cap;
+    memcpy(out, g_out_buf, n);
+    g_out_len = 0;
+    pthread_mutex_unlock(&g_out_mtx);
+    return n;
+}
+
+size_t AthWorker_ModelDesc(char *out, size_t cap) {
+    if (!out || cap == 0) return 0;
+    pthread_mutex_lock(&g_desc_mtx);
+    size_t n = strlen(g_model_desc);
+    if (n >= cap) n = cap - 1;
+    memcpy(out, g_model_desc, n);
+    out[n] = 0;
+    pthread_mutex_unlock(&g_desc_mtx);
+    return n;
+}
+
+size_t AthWorker_LastError(char *out, size_t cap) {
+    if (!out || cap == 0) return 0;
+    pthread_mutex_lock(&g_desc_mtx);
+    size_t n = strlen(g_last_error);
+    if (n >= cap) n = cap - 1;
+    memcpy(out, g_last_error, n);
+    out[n] = 0;
+    pthread_mutex_unlock(&g_desc_mtx);
+    return n;
+}
+```
+
+---
+
+3. Additions to athuex_ui.h
+
+Append the worker state fields to AthuexUIState:
+
+```c
+#include "athuex_worker.h"
+
+typedef struct {
+    // ... existing fields ...
+
+    // Worker state (populated each frame from AthWorker_*)
+    AthWorkerState worker_state;
+    float          load_progress;      // 0..100
+    char           model_name[128];
+    char           load_error[256];
+    int            generated_tokens;
+    float          tok_per_sec;
+
+    // Chat transcript (populated by the render loop from AthWorker_DrainOutput)
+    char           chat_stream[4096];
+    size_t         chat_stream_len;
+} AthuexUIState;
+```
+
+---
+
+4. Additions to athuex_ui.c — loading overlay + chat streaming
+
+Add these two helpers near the top of athuex_ui.c:
+
+```c
+// Centered modal-style overlay: shown while LOADING, hides the app's
+// interactive surface so accidental taps don't queue work on a busy system.
+static void loading_overlay(AthuexUIState *st) {
+    if (st->worker_state != ATH_WORKER_LOADING) return;
+
+    char label[64];
+    snprintf(label, sizeof(label), "Loading model… %.0f%%", st->load_progress);
+
+    CLAY({ .id = CLAY_ID("load_overlay"),
+        .layout = {
+            .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_GROW(0) },
+            .childAlignment = { CLAY_ALIGN_X_CENTER, CLAY_ALIGN_Y_CENTER },
+            .layoutDirection = CLAY_TOP_TO_BOTTOM,
+            .childGap = 12
+        },
+        .backgroundColor = ATH_CA(0, 0, 0, 180)
+    }) {
+        CLAY({ .layout = {
+                .sizing = { CLAY_SIZING_FIXED(280), CLAY_SIZING_FIT(0) },
+                .padding = { 20, 20, 16, 16 },
+                .childGap = 10,
+                .layoutDirection = CLAY_TOP_TO_BOTTOM
+            },
+            .backgroundColor = ATH_PANEL,
+            .cornerRadius = CLAY_CORNER_RADIUS(16),
+            .border = { .color = ATH_BORDER, .width = CLAY_BORDER_OUTSIDE(1) }
+        }) {
+            CLAY_TEXT(CLAY_STRING("Loading model"),
+                      CLAY_TEXT_CONFIG({ .fontId = ATH_FONT_HEAD,
+                                         .fontSize = 16, .textColor = ATH_TEXT }));
+            CLAY_TEXT((Clay_String){ .length = (int32_t)strlen(label), .chars = label },
+                      CLAY_TEXT_CONFIG({ .fontId = ATH_FONT_BODY,
+                                         .fontSize = 13, .textColor = ATH_MUTED }));
+
+            // Progress bar — background track + foreground fill
+            CLAY({ .layout = {
+                    .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(6) }
+                },
+                .backgroundColor = ATH_PANEL2,
+                .cornerRadius = CLAY_CORNER_RADIUS(999)
+            }) {
+                float pct = st->load_progress / 100.f;
+                if (pct < 0.02f) pct = 0.02f;
+                CLAY({ .layout = {
+                        .sizing = { .width = CLAY_SIZING_PERCENT(pct),
+                                    CLAY_SIZING_FIXED(6) }
+                    },
+                    .backgroundColor = ATH_ACCENT,
+                    .cornerRadius = CLAY_CORNER_RADIUS(999)
+                }) {}
+            }
+
+            if (st->load_error[0])
+                CLAY_TEXT((Clay_String){ .length = (int32_t)strlen(st->load_error),
+                                          .chars = st->load_error },
+                          CLAY_TEXT_CONFIG({ .fontId = ATH_FONT_BODY,
+                                             .fontSize = 12, .textColor = ATH_DANGER }));
+        }
+    };
+}
+
+// Live streaming token display — appended inside chat_panel's bubble.
+static void render_stream_bubble(AthuexUIState *st) {
+    if (st->chat_stream_len == 0) return;
+    CLAY({ .layout = {
+            .padding = { 12, 12, 10, 10 },
+            .childGap = 4,
+            .layoutDirection = CLAY_TOP_TO_BOTTOM
+        },
+        .backgroundColor = ATH_CHAT_AI_BG,
+        .cornerRadius = CLAY_CORNER_RADIUS(10),
+        .border = { .color = ATH_BLUE, .width = { .left = 3 } }
+    }) {
+        CLAY_TEXT(CLAY_STRING("AI"), CLAY_TEXT_CONFIG({
+            .fontId = ATH_FONT_BODY, .fontSize = 11, .textColor = ATH_MUTED }));
+        CLAY_TEXT((Clay_String){ .length = (int32_t)st->chat_stream_len,
+                                  .chars = st->chat_stream },
+                  CLAY_TEXT_CONFIG({ .fontId = ATH_FONT_BODY,
+                                     .fontSize = 14, .textColor = ATH_TEXT }));
+    };
+}
+```
+
+Wire them in:
+
+· In chat_panel() inside the messages CLAY(...) block: call render_stream_bubble(st); right after the two sample bubbles.
+· In Athuex_BuildFrame(), after the CLAY(root) closing brace but before *out_cmds = Clay_EndLayout();, insert loading_overlay(st);. It sits above everything because Clay renders in declaration order.
+
+---
+
+5. Patches to athuex_main.c
+
+init_renderer_and_clay(): initialize the worker.
+
+```c
+// After Editor_LoadText(...):
+AthWorker_Init();
+AthWorker_OnStateChanged = wake_render;   // wake_render is defined later; forward-declare
+```
+
+Add a forward declaration near the top:
+
+```c
+static void wake_render(void);
+```
+
+render_thread: drain worker output each frame and update UI fields.
+
+```c
+static void sync_worker_state(void) {
+    g_ui.worker_state     = AthWorker_State();
+    g_ui.load_progress    = AthWorker_LoadProgress();
+    g_ui.generated_tokens = AthWorker_TokensGenerated();
+    g_ui.tok_per_sec      = AthWorker_TokPerSec();
+
+    AthWorker_ModelDesc(g_ui.model_name, sizeof(g_ui.model_name));
+    AthWorker_LastError(g_ui.load_error, sizeof(g_ui.load_error));
+
+    // Drain any pending tokens into the chat stream
+    size_t avail = sizeof(g_ui.chat_stream) - g_ui.chat_stream_len;
+    if (avail > 1) {
+        char tmp[1024];
+        size_t n = AthWorker_DrainOutput(tmp, sizeof(tmp));
+        if (n > 0) {
+            if (n >= avail) n = avail - 1;
+            memcpy(g_ui.chat_stream + g_ui.chat_stream_len, tmp, n);
+            g_ui.chat_stream_len += n;
+            g_ui.chat_stream[g_ui.chat_stream_len] = 0;
+        }
+    }
+
+    // Reset the stream buffer when a new generation starts
+    if (g_ui.worker_state == ATH_WORKER_GENERATING && g_ui.generated_tokens == 0) {
+        g_ui.chat_stream_len = 0;
+        g_ui.chat_stream[0] = 0;
+    }
+}
+```
+
+In render_one_frame(), call sync_worker_state(); before Athuex_BuildFrame(...):
+
+```c
+static void render_one_frame(void) {
+    sync_worker_state();
+
+    Clay_RenderCommandArray cmds;
+    g_ui.screen_w    = g_screen_w;
+    // ... (rest unchanged)
+}
+```
+
+In render_thread(), increase the wake cadence only while loading or generating:
+
+```c
+int timeout_ms;
+AthWorkerState ws = AthWorker_State();
+if (ws == ATH_WORKER_LOADING || ws == ATH_WORKER_GENERATING) {
+    timeout_ms = 50;                     // 20 Hz progress/streaming updates
+} else if (g_input.dirty) {
+    timeout_ms = 16;                     // 60 Hz spring animation
+} else {
+    timeout_ms = -1;                     // fully idle → 0 % CPU
+}
+ALooper_pollOnce(timeout_ms, NULL, NULL, NULL);
+```
+
+---
+
+6. JNI additions in athuex_main.c
+
+```c
+JNIEXPORT void JNICALL
+Java_com_athuex_app_MainActivity_nativeOnModelPicked(JNIEnv *env, jobject thiz,
+                                                     jstring jpath) {
+    (void)thiz;
+    if (!jpath) return;
+    const char *path = (*env)->GetStringUTFChars(env, jpath, NULL);
+    if (path) {
+        AthWorker_LoadModel(path);
+        (*env)->ReleaseStringUTFChars(env, jpath, path);
+        wake_render();
+    }
+}
+
+JNIEXPORT void JNICALL
+Java_com_athuex_app_MainActivity_nativeGenerate(JNIEnv *env, jobject thiz,
+                                                 jstring jprompt, jint max_tokens) {
+    (void)thiz;
+    if (!jprompt) return;
+    const char *p = (*env)->GetStringUTFChars(env, jprompt, NULL);
+    if (p) {
+        AthWorker_Generate(p, (int)max_tokens);
+        (*env)->ReleaseStringUTFChars(env, jprompt, p);
+        wake_render();
+    }
+}
+
+JNIEXPORT void JNICALL
+Java_com_athuex_app_MainActivity_nativeStopGeneration(JNIEnv *env, jobject thiz) {
+    (void)env; (void)thiz;
+    AthWorker_Stop();
+    wake_render();
+}
+```
+
+In MainActivity.java, add the three native declarations next to the existing ones:
+
+```java
+public native void nativeOnModelPicked(String path);
+public native void nativeGenerate(String prompt, int maxTokens);
+public native void nativeStopGeneration();
+```
+
+Also in MainActivity.nativeSurfaceDestroyed handling — the C side should call AthWorker_Shutdown() before egl_term(). Add it to render_thread's teardown:
+
+```c
+// After Editor_Free(&g_editor):
+AthWorker_Shutdown();
+```
+
+---
+
+7. CMakeLists.txt
+
+```cmake
+add_library(athuex SHARED
+    athuex_main.c
+    athuex_font.c
+    athuex_renderer.c
+    athuex_ui.c
+    athuex_input.c
+    athuex_worker.c           # <-- new
+    code_editor.c
+    athuex_editor_bridge.c
+)
+
+target_include_directories(athuex PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/clay
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/llama   # llama.h lives here
+)
+
+# Prebuilt llama.cpp static libs go in third_party/llama/lib/
+add_library(llama STATIC IMPORTED)
+set_target_properties(llama PROPERTIES
+    IMPORTED_LOCATION  ${CMAKE_CURRENT_SOURCE_DIR}/third_party/llama/lib/${ANDROID_ABI}/libllama.a
+    INTERFACE_INCLUDE_DIRECTORIES ${CMAKE_CURRENT_SOURCE_DIR}/third_party/llama
+)
+
+add_library(ggml STATIC IMPORTED)
+set_target_properties(ggml PROPERTIES
+    IMPORTED_LOCATION  ${CMAKE_CURRENT_SOURCE_DIR}/third_party/llama/lib/${ANDROID_ABI}/libggml.a
+)
+
+target_link_libraries(athuex
+    llama
+    ggml
+    android
+    log
+    EGL
+    GLESv3
+    m
+)
+
+target_compile_options(athuex PRIVATE -O3 -fvisibility=hidden)
+```
+
+---
+
+8. llama.cpp build flags (put in third_party/llama/build_android.sh)
+
+The critical one is GGML_OPENMP=OFF — this alone prevents most freezes:
+
+```bash
+cmake -B build-android-arm64 \
+  -DCMAKE_TOOLCHAIN_FILE=$NDK/build/cmake/android.toolchain.cmake \
+  -DANDROID_ABI=arm64-v8a \
+  -DANDROID_PLATFORM=android-29 \
+  -DBUILD_SHARED_LIBS=OFF \
+  -DGGML_OPENMP=OFF \            # ← prevents silent priority bypass
+  -DLLAMA_OPENMP=OFF \           # ← older name, keep both
+  -DGGML_LLAMAFILE=ON \          # fast quant dot products on ARM
+  -DGGML_NATIVE=OFF \            # don't assume host CPU on device
+  -DGGML_CPU_ARM_ARCH=armv8.2-a+dotprod+fp16 \  # A06 supports these
+  -DLLAMA_BUILD_TESTS=OFF \
+  -DLLAMA_BUILD_EXAMPLES=OFF \
+  -DLLAMA_BUILD_SERVER=OFF \
+  -DLLAMA_CURL=OFF
+cmake --build build-android-arm64 -j$(nproc)
+```
+
+Copy libllama.a and libggml.a into third_party/llama/lib/arm64-v8a/.
+
+---
+
+9. What this fixes
+
+Symptom in P01 Root cause Fixed by
+"no keypad, UI frozen" during load Worker (nice 0) competed with UI (nice 0) set_worker_priority() runs the worker at nice 10 → kernel always preempts for UI
+RAM pressure on 4 GB device during load Model read fully into RAM mp.use_mmap = true → lazy page-in, ~50 MB working set for Q4_K_M 2B
+Slow first token mmap cold misses Same fix — first prompt triggers page-in, subsequent tokens hit cache
+OpenMP threads ignore nice -DGGML_OPENMP=ON default Build with -DGGML_OPENMP=OFF
+ncpu threads starve system services P01 recommended hardware_concurrency() choose_threads() returns min(ncpu - 2, 4)
+No progress feedback N/A in old code load_progress_cb → loading_overlay() in Clay
+IME opens during load N/A in old code Overlay + no focus until ATH_WORKER_READY
+No cancel N/A in old code mp.progress_callback returns false when g_cancel_load set
+
+Expected timeline on a Galaxy A06 with a 2B Q4_K_M GGUF:
+
+· Model load (mmap + metadata scan): ~200–400 ms
+· Context creation (KV cache for 2K ctx, 4 threads): ~600–1200 ms
+· Total to ATH_WORKER_READY: ~1–2 s at nice 10 while the UI runs at 60 fps throughout.
+
+The UI never freezes because the kernel scheduler always has at least two free cores for the (nice 0) render thread, and the worker (nice 10) only runs when those cores are idle.

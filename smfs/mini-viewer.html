@@ -1,0 +1,95 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>SMFS Mini Viewer</title>
+  <style>
+    body { font-family: -apple-system, BlinkMacSystemFont, sans-serif; background: #0a0a0c; color: #e4e4e8;
+      display: flex; flex-direction: column; align-items: center; justify-content: center;
+      min-height: 100vh; margin: 0; padding: 20px; text-align: center; }
+    #drop { border: 2px dashed #4a3fc4; border-radius: 16px; padding: 48px 32px; max-width: 480px; width: 100%;
+      cursor: pointer; transition: border-color 0.2s; }
+    #drop.hover { border-color: #6c5ce7; background: #141418; }
+    h1 { font-size: 20px; margin-bottom: 8px; }
+    p { color: #888890; font-size: 14px; line-height: 1.6; }
+    #files { margin-top: 24px; text-align: left; width: 100%; max-width: 480px; }
+    .file { padding: 8px 12px; border-bottom: 1px solid #2a2a32; font-family: ui-monospace, monospace;
+      font-size: 13px; display: flex; justify-content: space-between; cursor: pointer; }
+    .file:hover { background: #141418; }
+    .file span:last-child { color: #888890; }
+    #preview { margin-top: 16px; background: #141418; border: 1px solid #2a2a32; border-radius: 8px;
+      padding: 12px; font-family: ui-monospace, monospace; font-size: 12px; white-space: pre-wrap;
+      text-align: left; max-height: 300px; overflow: auto; display: none; width: 100%; max-width: 480px; }
+  </style>
+</head>
+<body>
+  <h1>SMFS Mini Viewer</h1>
+  <p>Drop a <strong>.ssf</strong> file to inspect it.<br>No install, no network. Valid ZIP polyglot.</p>
+  <div id="drop">Drop .ssf here or tap to choose</div>
+  <div id="files"></div>
+  <pre id="preview"></pre>
+  <script>
+    const drop = document.getElementById('drop');
+    const filesEl = document.getElementById('files');
+    const preview = document.getElementById('preview');
+
+    drop.onclick = () => {
+      const inp = document.createElement('input');
+      inp.type = 'file';
+      inp.accept = '.ssf,.zip,application/zip,application/x-syntropic';
+      inp.onchange = () => inp.files[0] && handleFile(inp.files[0]);
+      inp.click();
+    };
+    drop.ondragover = (e) => { e.preventDefault(); drop.classList.add('hover'); };
+    drop.ondragleave = () => drop.classList.remove('hover');
+    drop.ondrop = (e) => {
+      e.preventDefault();
+      drop.classList.remove('hover');
+      const f = e.dataTransfer.files[0];
+      if (f) handleFile(f);
+    };
+
+    async function handleFile(file) {
+      filesEl.innerHTML = '';
+      preview.style.display = 'none';
+      const buf = new Uint8Array(await file.arrayBuffer());
+      const names = extractZipFilenames(buf);
+      if (!names.length) {
+        filesEl.innerHTML = '<div class="file">No files found. Is this a valid .ssf / ZIP?</div>';
+        return;
+      }
+      filesEl.innerHTML = '<div class="file"><span>Path</span><span>Note</span></div>';
+      for (const name of names) {
+        const div = document.createElement('div');
+        div.className = 'file';
+        div.innerHTML = '<span></span><span>ZIP entry</span>';
+        div.querySelector('span').textContent = name;
+        div.onclick = () => {
+          preview.textContent = 'File: ' + name + '\nVolume: ' + file.name + ' (' + (file.size / 1024).toFixed(1) + ' KB)\n\nOpen in full Athuex to mount as live filesystem.';
+          preview.style.display = 'block';
+        };
+        filesEl.appendChild(div);
+      }
+    }
+
+    function extractZipFilenames(u8) {
+      const names = [];
+      const dv = new DataView(u8.buffer, u8.byteOffset, u8.byteLength);
+      for (let i = 0; i < u8.length - 4; i++) {
+        if (dv.getUint32(i, true) === 0x02014b50) {
+          const nameLen = dv.getUint16(i + 28, true);
+          const extraLen = dv.getUint16(i + 30, true);
+          const commentLen = dv.getUint16(i + 32, true);
+          try {
+            const name = new TextDecoder().decode(u8.subarray(i + 46, i + 46 + nameLen));
+            if (name && !names.includes(name)) names.push(name);
+          } catch (_) {}
+          i += 46 + nameLen + extraLen + commentLen - 1;
+        }
+      }
+      return names;
+    }
+  </script>
+</body>
+</html>

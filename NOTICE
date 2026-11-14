@@ -1,0 +1,4 @@
+Athuex includes third-party software. See LICENSE and:
+  third_party/imgui/LICENSE.txt
+  third_party/llama.cpp/LICENSE (when present)
+Broodrix-owned project files are under the Athuex Proprietary License — Broodrix.
