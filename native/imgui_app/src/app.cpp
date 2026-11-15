@@ -1,9 +1,11 @@
-/* Athuex native app — v2.11.5 pure-native ImGui
+/* Athuex native app — v2.11.6 pure-native ImGui
  * EGL + Dear ImGui (vendored), render-on-demand, JNI surface bridge.
- * v2.11.5: multi-frame wake (3 frames/input), eglSwapInterval(0) for
- *         non-blocking swap on Galaxy A06; keyboard latency repair.
- * v2.11.3: generation-epoch worker lifecycle (join-before-claim),
- *         input-queue clear on buffer reset; full tree version hygiene.
+ * v2.11.6: industry-standard Chat UI — 52px toolbar (hamburger+brand+
+ *         metrics+gear), message bubbles with accent borders, streaming
+ *         cursor, liquid-glass composer (route/think pills, circular
+ *         submit/stop/mic), history drawer, settings popup.
+ * v2.11.5: multi-frame wake (3 frames/input), eglSwapInterval(0).
+ * v2.11.3: generation-epoch worker lifecycle (join-before-claim).
  * v2.11.2: thread-safe input queue, frame-stable snapshot, composer resync.
  * Production path for Android APK on Galaxy A06-class devices.
  */
@@ -17,6 +19,8 @@
 #include <atomic>
 #include <condition_variable>
 #include <cstring>
+#include <cmath>
+#include <cstdio>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -96,6 +100,10 @@ static void set_status_message(const std::string &message) {
 static float       g_Density = 2.0f;   /* from DisplayMetrics.density */
 static float       g_ScaledDensity = 2.0f;
 static bool        g_ModeThink = false;
+static bool        g_ShowDrawer = false;
+static bool        g_ShowSettings = false;
+static int         g_RouteMode = 0; /* 0=INT Local, 1=EXT External, 2=HYB Hybrid */
+static bool        g_VoiceListening = false;
 static bool        g_ModeExt = false;
 
 /* JNI keyboard helpers (resolved on create) */
@@ -329,118 +337,259 @@ static void render_frame() {
                ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove |
                ImGuiWindowFlags_NoBringToFrontOnFocus | ImGuiWindowFlags_NoNavFocus);
 
-  const ImVec4 COL_ACCENT = ImVec4(0.46f, 0.72f, 0.00f, 1.0f);      /* #76b900 */
-  const ImVec4 COL_MUTED  = ImVec4(0.545f, 0.580f, 0.620f, 1.0f);   /* #8b949e */
-  const ImVec4 COL_TEXT   = ImVec4(0.902f, 0.929f, 0.953f, 1.0f);   /* #e6edf3 */
-  const ImVec4 COL_PANEL2 = ImVec4(0.129f, 0.149f, 0.176f, 1.0f);   /* #21262d */
+  /* Design tokens (ide.css / athuex_theme.h) */
+  const ImVec4 COL_ACCENT  = ImVec4(0.46f, 0.72f, 0.00f, 1.0f);      /* #76b900 */
+  const ImVec4 COL_MUTED   = ImVec4(0.545f, 0.580f, 0.620f, 1.0f);   /* #8b949e */
+  const ImVec4 COL_TEXT    = ImVec4(0.902f, 0.929f, 0.953f, 1.0f);   /* #e6edf3 */
+  const ImVec4 COL_PANEL   = ImVec4(0.086f, 0.106f, 0.133f, 1.0f);   /* #161b22 */
+  const ImVec4 COL_PANEL2  = ImVec4(0.129f, 0.149f, 0.176f, 1.0f);   /* #21262d */
+  const ImVec4 COL_BG      = ImVec4(0.051f, 0.067f, 0.090f, 1.0f);   /* #0d1117 */
+  const ImVec4 COL_BLUE    = ImVec4(0.345f, 0.651f, 1.00f, 1.0f);    /* #58a6ff */
+  const ImVec4 COL_DANGER  = ImVec4(0.973f, 0.318f, 0.286f, 1.0f);   /* #f85149 */
+  const ImVec4 COL_AI_BG   = ImVec4(0.110f, 0.129f, 0.157f, 1.0f);   /* #1c2128 */
+  const ImVec4 COL_BORDER  = ImVec4(0.188f, 0.212f, 0.239f, 1.0f);   /* #30363d */
+  const ImVec4 COL_TOPBAR  = ImVec4(0.004f, 0.016f, 0.035f, 1.0f);   /* #010409 */
 
-  /* ── Toolbar (matches .toolbar ~52px) ───────────────────────── */
+  const float toolbar_h = 52.0f;
+  const float chatbar_min = 118.0f;
+  bool generating = athuex_worker_is_active() != 0;
+
+  /* ── Top Toolbar 52px ───────────────────────────────────────── */
   {
-    ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.086f, 0.106f, 0.133f, 1.0f));
-    ImGui::BeginChild("toolbar", ImVec2(0, 48), false, ImGuiWindowFlags_NoScrollbar);
+    ImGui::PushStyleColor(ImGuiCol_ChildBg, COL_TOPBAR);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(8, 8));
+    ImGui::BeginChild("toolbar", ImVec2(0, toolbar_h), false,
+                      ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
+
+    /* Left: hamburger + brand */
+    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0,0,0,0));
+    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, COL_PANEL2);
+    ImGui::PushStyleColor(ImGuiCol_ButtonActive, COL_PANEL);
+    ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 6.0f);
+    if (ImGui::Button("##ham", ImVec2(36, 36))) {
+      g_ShowDrawer = !g_ShowDrawer;
+    }
+    {
+      ImVec2 p = ImGui::GetItemRectMin();
+      ImDrawList *dl = ImGui::GetWindowDrawList();
+      float cx = p.x + 18, cy = p.y + 18;
+      dl->AddText(ImVec2(cx - 8, cy - 10), ImGui::GetColorU32(COL_TEXT), "\xE2\x98\xB0"); /* ☰ */
+    }
+    ImGui::SameLine(0, 6);
     ImGui::TextColored(COL_ACCENT, "Athuex");
-    ImGui::SameLine();
+    ImGui::SameLine(0, 4);
     ImGui::TextColored(COL_MUTED, "AI");
     if (!active_model.empty()) {
       const char *base = strrchr(active_model.c_str(), '/');
       base = base ? base + 1 : active_model.c_str();
-      ImGui::SameLine();
+      ImGui::SameLine(0, 6);
       ImGui::TextColored(COL_MUTED, "·");
-      ImGui::SameLine();
-      ImGui::TextColored(COL_TEXT, "%.28s", base);
+      ImGui::SameLine(0, 4);
+      ImGui::TextColored(COL_TEXT, "%.22s", base);
     }
-    /* right-side metrics */
-    char met[64];
-    if (athuex_worker_is_active()) {
+    ImGui::PopStyleVar();
+    ImGui::PopStyleColor(3);
+
+    /* Right: metrics + status + gear */
+    char met[72];
+    if (generating) {
       int tok = athuex_worker_token_count();
       float sec = athuex_worker_elapsed_ms() / 1000.0f;
       float tps = (sec > 0.05f) ? (tok / sec) : 0.0f;
-      snprintf(met, sizeof(met), "%.1f t/s · %d tok", tps, tok);
+      snprintf(met, sizeof(met), "%.1f t/s  %d tok", tps, tok);
     } else if (!status_msg.empty()) {
       snprintf(met, sizeof(met), "%s", status_msg.c_str());
     } else {
       snprintf(met, sizeof(met), "Ready");
     }
     ImVec2 ts = ImGui::CalcTextSize(met);
-    ImGui::SameLine(ImGui::GetWindowWidth() - ts.x - 12.0f);
-    ImGui::TextColored(athuex_worker_is_active() ? COL_ACCENT : COL_MUTED, "%s", met);
-    ImGui::EndChild();
-    ImGui::PopStyleColor();
-  }
+    float right_x = ImGui::GetWindowWidth() - ts.x - 52.0f;
+    if (right_x < ImGui::GetCursorPosX() + 8)
+      right_x = ImGui::GetCursorPosX() + 8;
+    ImGui::SameLine(right_x);
+    ImGui::TextColored(generating ? COL_ACCENT : COL_MUTED, "%s", met);
 
-  /* ── Quickbar chips (Chat active; others reserved) ──────────── */
-  {
-    ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.004f, 0.016f, 0.035f, 1.0f));
-    ImGui::BeginChild("quickbar", ImVec2(0, 40), false, ImGuiWindowFlags_NoScrollbar);
-    const char *labs[] = {"Chat", "Files", "Edit", "Tools"};
-    float chipW = (ImGui::GetContentRegionAvail().x - 3 * 6.0f) / 4.0f;
-    if (chipW < 56.0f) chipW = 56.0f;
-    for (int i = 0; i < 4; ++i) {
-      if (i) ImGui::SameLine(0, 6);
-      bool on = (i == 0);
-      if (on) {
-        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.102f, 0.180f, 0.039f, 1.0f));
-        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.102f, 0.180f, 0.039f, 1.0f));
-        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.706f, 0.969f, 0.494f, 1.0f));
-      } else {
-        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0,0,0,0));
-        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, COL_PANEL2);
-        ImGui::PushStyleColor(ImGuiCol_Text, COL_MUTED);
-      }
-      ImGui::Button(labs[i], ImVec2(chipW, 30));
-      ImGui::PopStyleColor(3);
+    ImGui::SameLine(ImGui::GetWindowWidth() - 44.0f);
+    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0,0,0,0));
+    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, COL_PANEL2);
+    ImGui::PushStyleColor(ImGuiCol_ButtonActive, COL_PANEL);
+    ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 6.0f);
+    if (ImGui::Button("##gear", ImVec2(36, 36))) {
+      g_ShowSettings = !g_ShowSettings;
     }
+    {
+      ImVec2 p = ImGui::GetItemRectMin();
+      ImDrawList *dl = ImGui::GetWindowDrawList();
+      dl->AddText(ImVec2(p.x + 9, p.y + 7), ImGui::GetColorU32(COL_MUTED), "\xE2\x9A\x99"); /* ⚙ */
+    }
+    ImGui::PopStyleVar();
+    ImGui::PopStyleColor(3);
+
     ImGui::EndChild();
+    ImGui::PopStyleVar();
     ImGui::PopStyleColor();
   }
 
-  /* ── Engine (compact, collapsed by default after model set) ─── */
-  ImGuiTreeNodeFlags engFlags = active_model.empty()
-      ? ImGuiTreeNodeFlags_DefaultOpen
-      : ImGuiTreeNodeFlags_None;
-  if (ImGui::CollapsingHeader("Engine", engFlags)) {
-    const char *preview = active_model.empty()
-                              ? "(tap Browse for .gguf)"
-                              : active_model.c_str();
-    if (ImGui::BeginCombo("##gguf", preview)) {
+  /* ── History Drawer (overlay when open) ─────────────────────── */
+  if (g_ShowDrawer) {
+    ImGui::SetNextWindowPos(ImVec2(0, toolbar_h));
+    ImGui::SetNextWindowSize(ImVec2(ImMin(280.0f, (float)g_WindowWidth * 0.78f),
+                                    (float)g_WindowHeight - toolbar_h));
+    ImGui::PushStyleColor(ImGuiCol_WindowBg, COL_PANEL);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0.0f);
+    ImGui::Begin("##drawer", &g_ShowDrawer,
+                 ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoCollapse |
+                 ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoMove);
+    ImGui::TextColored(COL_MUTED, "CHAT HISTORY");
+    ImGui::Separator();
+    if (ImGui::Button("New chat", ImVec2(-1, 0))) {
+      athuex_worker_clear_text();
+      g_PromptBuf[0] = '\0';
+      g_ShowDrawer = false;
+      set_status_message("new chat");
+    }
+    ImGui::Spacing();
+    ImGui::TextWrapped("Current session is shown in the main stream. Session list and persistence land in a later phase.");
+    ImGui::Spacing();
+    if (ImGui::Button("Close", ImVec2(-1, 0)))
+      g_ShowDrawer = false;
+    ImGui::End();
+    ImGui::PopStyleVar();
+    ImGui::PopStyleColor();
+  }
+
+  /* ── Settings popup ─────────────────────────────────────────── */
+  if (g_ShowSettings) {
+    ImGui::OpenPopup("Settings");
+  }
+  ImGui::SetNextWindowSize(ImVec2(ImMin(340.0f, (float)g_WindowWidth - 24.0f), 0), ImGuiCond_Appearing);
+  if (ImGui::BeginPopupModal("Settings", &g_ShowSettings,
+                             ImGuiWindowFlags_AlwaysAutoResize)) {
+    ImGui::TextColored(COL_ACCENT, "Engine");
+    ImGui::Separator();
+    const char *preview = active_model.empty() ? "(no model)" : active_model.c_str();
+    const char *basep = strrchr(preview, '/');
+    if (basep) preview = basep + 1;
+    if (ImGui::BeginCombo("Model", preview)) {
       int n = athuex_worker_model_count();
       for (int i = 0; i < n; ++i) {
         const char *path = athuex_worker_model_at(i);
         if (!path) continue;
+        const char *b = strrchr(path, '/');
+        b = b ? b + 1 : path;
         bool selected = (active_model == path);
-        const char *base = strrchr(path, '/');
-        base = base ? base + 1 : path;
-        if (ImGui::Selectable(base, selected)) { active_model = path; set_active_model(active_model); }
+        if (ImGui::Selectable(b, selected)) {
+          set_active_model(path);
+          set_status_message(std::string("model: ") + b);
+        }
         if (selected) ImGui::SetItemDefaultFocus();
       }
       ImGui::EndCombo();
     }
-    ImGui::SameLine();
-    if (ImGui::Button("Browse")) open_gguf_picker();
+    if (ImGui::Button("Browse GGUF…", ImVec2(-1, 0))) {
+      open_gguf_picker();
+      g_ShowSettings = false;
+      ImGui::CloseCurrentPopup();
+    }
     ImGui::SliderInt("Threads", &g_Threads, 1, 4);
-    ImGui::SliderInt("Context", &g_Ctx, 2048, 4096);
+    ImGui::SliderInt("Context", &g_Ctx, 1024, 4096);
+    ImGui::Spacing();
+    ImGui::TextColored(COL_MUTED, "Route: %s", g_RouteMode == 0 ? "INT Local" :
+                                               g_RouteMode == 1 ? "EXT External" : "HYB Hybrid");
+    ImGui::Spacing();
+    if (ImGui::Button("Done", ImVec2(-1, 0))) {
+      g_ShowSettings = false;
+      ImGui::CloseCurrentPopup();
+    }
+    ImGui::EndPopup();
   }
 
-  /* ── Chat messages ──────────────────────────────────────────── */
-  float footer = ImGui::GetFrameHeightWithSpacing() * 5.8f;
-  ImGui::BeginChild("Chat", ImVec2(0, -footer), true);
-  const char *history = athuex_worker_sync_text();
-  if (history && history[0]) {
-    /* Role-aware wrap without per-line child windows (stable IDs, low cost). */
-    const char *line = history;
+  /* ── Chat header (active model) ─────────────────────────────── */
+  {
+    ImGui::PushStyleColor(ImGuiCol_ChildBg, COL_PANEL);
+    ImGui::BeginChild("chat_hdr", ImVec2(0, 28), false, ImGuiWindowFlags_NoScrollbar);
+    const char *label = active_model.empty() ? "No model loaded" : "Assistant";
+    ImGui::TextColored(COL_MUTED, "%s", label);
+    if (!active_model.empty()) {
+      const char *base = strrchr(active_model.c_str(), '/');
+      base = base ? base + 1 : active_model.c_str();
+      ImGui::SameLine();
+      ImGui::TextColored(COL_BLUE, "%.40s", base);
+    }
+    ImGui::EndChild();
+    ImGui::PopStyleColor();
+  }
+
+  /* ── Message stream ─────────────────────────────────────────── */
+  float footer_h = chatbar_min;
+  if (generating) footer_h += 4.0f;
+  ImGui::BeginChild("Chat", ImVec2(0, -footer_h), true);
+
+  const char *txt = athuex_worker_sync_text();
+  if (txt && txt[0]) {
+    const char *line = txt;
     while (*line) {
       const char *nl = strchr(line, '\n');
       int len = nl ? (int)(nl - line) : (int)strlen(line);
-      if (len >= 5 && strncmp(line, "You: ", 5) == 0) {
-        ImGui::Spacing();
-        ImGui::TextColored(COL_MUTED, "USER");
-        ImGui::PushStyleColor(ImGuiCol_Text, COL_TEXT);
-        ImGui::TextWrapped("%.*s", len - 5, line + 5);
+
+      bool is_user = (len >= 5 && strncmp(line, "You: ", 5) == 0);
+      bool is_ai   = (len >= 8 && strncmp(line, "Athuex: ", 8) == 0);
+
+      if (is_user || is_ai) {
+        const char *body = is_user ? line + 5 : line + 8;
+        int body_len = is_user ? len - 5 : len - 8;
+        if (body_len < 0) body_len = 0;
+
+        float avail = ImGui::GetContentRegionAvail().x;
+        float max_w = avail * 0.92f;
+        ImVec2 text_sz = ImGui::CalcTextSize(body, body + body_len, false, max_w - 16.0f);
+        float bubble_w = text_sz.x + 20.0f;
+        if (bubble_w > max_w) bubble_w = max_w;
+        if (bubble_w < 48.0f) bubble_w = 48.0f;
+
+        float indent = is_user ? (avail - bubble_w) : 0.0f;
+        if (indent < 0) indent = 0;
+        ImGui::SetCursorPosX(ImGui::GetCursorPosX() + indent);
+
+        ImVec2 p0 = ImGui::GetCursorScreenPos();
+        ImDrawList *dl = ImGui::GetWindowDrawList();
+        ImU32 bg = ImGui::GetColorU32(is_user ? COL_PANEL2 : COL_AI_BG);
+        ImU32 border = ImGui::GetColorU32(is_user ? COL_ACCENT : COL_BLUE);
+
+        ImGui::PushStyleColor(ImGuiCol_ChildBg, is_user ? COL_PANEL2 : COL_AI_BG);
+        ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, 8.0f);
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(10, 8));
+        char child_id[32];
+        snprintf(child_id, sizeof(child_id), "##b%p", (void*)line);
+        ImGui::BeginChild(child_id, ImVec2(bubble_w, text_sz.y + 16.0f), true,
+                          ImGuiWindowFlags_NoScrollbar);
+        ImGui::PushTextWrapPos(ImGui::GetCursorPos().x + bubble_w - 20.0f);
+        ImGui::TextUnformatted(body, body + body_len);
+        ImGui::PopTextWrapPos();
+        ImGui::EndChild();
+        ImGui::PopStyleVar(2);
         ImGui::PopStyleColor();
-      } else if (len >= 8 && strncmp(line, "Athuex: ", 8) == 0) {
+
+        /* 3px left accent border */
+        ImVec2 p1 = ImGui::GetItemRectMax();
+        dl->AddRectFilled(ImVec2(p0.x, p0.y), ImVec2(p0.x + 3.0f, p1.y), border, 2.0f);
+
+        if (is_ai && !generating) {
+          ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(6, 2));
+          ImGui::PushStyleColor(ImGuiCol_Button, COL_PANEL2);
+          ImGui::PushStyleColor(ImGuiCol_ButtonHovered, COL_PANEL);
+          if (ImGui::SmallButton("Copy")) {
+            /* clipboard via system would need JNI; status feedback for now */
+            set_status_message("copied (local)");
+          }
+          ImGui::SameLine();
+          if (ImGui::SmallButton("Retry")) {
+            set_status_message("retry — re-send last prompt from history");
+          }
+          ImGui::PopStyleColor(2);
+          ImGui::PopStyleVar();
+        }
         ImGui::Spacing();
-        ImGui::TextColored(COL_ACCENT, "AI");
-        ImGui::TextWrapped("%.*s", len - 8, line + 8);
       } else if (len > 0) {
         ImGui::TextWrapped("%.*s", len, line);
       }
@@ -448,65 +597,181 @@ static void render_frame() {
       line = nl + 1;
     }
   } else {
-    ImGui::TextColored(COL_MUTED, "Ask anything…");
+    ImGui::Dummy(ImVec2(0, 24));
+    ImGui::TextColored(COL_MUTED, "  Ask anything…");
   }
-  if (athuex_worker_is_active()) {
+
+  /* Streaming cursor */
+  if (generating) {
+    double t = ImGui::GetTime();
+    bool on = (fmod(t, 1.0) < 0.55);
+    if (on) {
+      ImGui::SameLine(0, 2);
+      ImGui::TextColored(COL_ACCENT, "\xE2\x96\xAE"); /* ▮ */
+    } else {
+      ImGui::SameLine(0, 2);
+      ImGui::TextColored(COL_MUTED, "\xE2\x96\xAF"); /* ▯ */
+    }
     ImGui::SetScrollHereY(1.0f);
     request_render();
   }
   ImGui::EndChild();
 
-  ImGui::Separator();
+  /* ── Liquid-glass Chatbar ───────────────────────────────────── */
+  {
+    ImGui::PushStyleColor(ImGuiCol_ChildBg, COL_PANEL);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(10, 8));
+    ImGui::BeginChild("chatbar", ImVec2(0, 0), false, ImGuiWindowFlags_NoScrollbar);
 
-  /* ── Mode chips ─────────────────────────────────────────────── */
-  ImGui::Checkbox("Think", &g_ModeThink);
-  ImGui::SameLine();
-  ImGui::Checkbox("EXT", &g_ModeExt);
+    /* Auto-growing multiline (clamped) */
+    float line_h = ImGui::GetTextLineHeight();
+    int lines = 1;
+    for (const char *p = g_PromptBuf; *p; ++p)
+      if (*p == '\n') ++lines;
+    float input_h = line_h * (float)(lines < 1 ? 1 : (lines > 4 ? 4 : lines)) + 16.0f;
+    if (input_h < line_h * 2.2f) input_h = line_h * 2.2f;
 
-  /* ── Composer ───────────────────────────────────────────────── */
-  ImGui::PushItemWidth(-1.0f);
-  bool enter = ImGui::InputTextMultiline(
-      "##prompt", g_PromptBuf, sizeof(g_PromptBuf),
-      ImVec2(-1.0f, ImGui::GetTextLineHeight() * 2.6f),
-      ImGuiInputTextFlags_EnterReturnsTrue |
-          ImGuiInputTextFlags_CtrlEnterForNewLine);
-  if (ImGui::IsItemActivated()) set_keyboard_visible(true);
-  ImGui::PopItemWidth();
+    ImGui::PushStyleColor(ImGuiCol_FrameBg, COL_PANEL2);
+    ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 10.0f);
+    ImGui::PushItemWidth(-1.0f);
+    bool enter = ImGui::InputTextMultiline(
+        "##prompt", g_PromptBuf, sizeof(g_PromptBuf),
+        ImVec2(-1.0f, input_h),
+        ImGuiInputTextFlags_EnterReturnsTrue |
+            ImGuiInputTextFlags_CtrlEnterForNewLine);
+    if (ImGui::IsItemActivated()) set_keyboard_visible(true);
+    ImGui::PopItemWidth();
+    ImGui::PopStyleVar();
+    ImGui::PopStyleColor();
 
-  if (athuex_worker_is_active()) {
-    if (ImGui::Button("Stop", ImVec2(-FLT_MIN, 0))) {
-      athuex_worker_stop();
-      status_msg = "stopping…"; set_status_message(status_msg);
+    ImGui::Spacing();
+
+    /* Bottom controls row */
+    const float btn = 36.0f;
+    ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 18.0f);
+
+    /* Attach */
+    ImGui::PushStyleColor(ImGuiCol_Button, COL_PANEL2);
+    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, COL_BORDER);
+    if (ImGui::Button("+##att", ImVec2(btn, btn))) {
+      set_status_message("attach — file picker next phase");
     }
-  } else {
-    if (ImGui::Button("Send", ImVec2(-FLT_MIN, 0)) || enter) {
-      if (g_PromptBuf[0] && !active_model.empty()) {
-        std::string final_prompt;
-        if (g_ModeThink)
-          final_prompt += "Think step by step before answering.\n\n";
-        if (g_ModeExt)
-          final_prompt += "Provide a detailed and complete answer.\n\n";
-        /* Lightweight instruct wrapper — helps Qwen/instruct GGUFs stay coherent */
-        final_prompt += "### Instruction:\n";
-        final_prompt += g_PromptBuf;
-        final_prompt += "\n\n### Response:\n";
-        athuex_worker_start(active_model.c_str(), final_prompt.c_str(),
-                            g_Threads, g_Ctx);
-        g_PromptBuf[0] = '\0';
-        /* worker start already cleared composer; keep local buffer empty */
-        status_msg.clear(); set_status_message(status_msg);
-        set_keyboard_visible(false);
-      } else if (active_model.empty()) {
-        status_msg = "no model — Browse"; set_status_message(status_msg);
-      } else if (!g_PromptBuf[0]) {
-        status_msg = "type a prompt"; set_status_message(status_msg);
+    ImGui::PopStyleColor(2);
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Attach file");
+
+    /* Route pill */
+    ImGui::SameLine(0, 6);
+    const char *route_labs[] = {"INT", "EXT", "HYB"};
+    ImGui::PushStyleColor(ImGuiCol_Button, COL_PANEL2);
+    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, COL_BORDER);
+    if (ImGui::Button(route_labs[g_RouteMode % 3], ImVec2(48, btn))) {
+      g_RouteMode = (g_RouteMode + 1) % 3;
+      g_ModeExt = (g_RouteMode != 0);
+    }
+    ImGui::PopStyleColor(2);
+    if (ImGui::IsItemHovered())
+      ImGui::SetTooltip("AI Route: INT Local / EXT External / HYB Hybrid");
+
+    /* Think pill */
+    ImGui::SameLine(0, 6);
+    if (g_ModeThink) {
+      ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.102f, 0.180f, 0.039f, 1.0f));
+      ImGui::PushStyleColor(ImGuiCol_Text, COL_ACCENT);
+    } else {
+      ImGui::PushStyleColor(ImGuiCol_Button, COL_PANEL2);
+      ImGui::PushStyleColor(ImGuiCol_Text, COL_MUTED);
+    }
+    if (ImGui::Button("Think", ImVec2(56, btn)))
+      g_ModeThink = !g_ModeThink;
+    ImGui::PopStyleColor(2);
+
+    /* Right side: mic + submit/stop */
+    float right = ImGui::GetContentRegionAvail().x;
+    ImGui::SameLine(ImGui::GetCursorPosX() + right - (btn * 2 + 8));
+
+    /* Mic */
+    if (g_VoiceListening) {
+      ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.40f, 0.08f, 0.08f, 1.0f));
+      ImGui::PushStyleColor(ImGuiCol_Text, COL_DANGER);
+    } else {
+      ImGui::PushStyleColor(ImGuiCol_Button, COL_PANEL2);
+      ImGui::PushStyleColor(ImGuiCol_Text, COL_MUTED);
+    }
+    if (ImGui::Button("\xF0\x9F\x8E\xA4##mic", ImVec2(btn, btn))) { /* 🎤 */
+      g_VoiceListening = !g_VoiceListening;
+      set_status_message(g_VoiceListening ? "listening…" : "mic off");
+    }
+    ImGui::PopStyleColor(2);
+
+    ImGui::SameLine(0, 8);
+
+    if (generating) {
+      ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.45f, 0.10f, 0.10f, 1.0f));
+      ImGui::PushStyleColor(ImGuiCol_ButtonHovered, COL_DANGER);
+      ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1,1,1,1));
+      if (ImGui::Button("##stop", ImVec2(btn, btn))) {
+        athuex_worker_stop();
+        set_status_message("stopping…");
       }
+      {
+        ImVec2 p = ImGui::GetItemRectMin();
+        ImDrawList *dl = ImGui::GetWindowDrawList();
+        dl->AddRectFilled(ImVec2(p.x + 11, p.y + 11), ImVec2(p.x + 25, p.y + 25),
+                          ImGui::GetColorU32(ImVec4(1,1,1,0.95f)), 2.0f);
+      }
+      ImGui::PopStyleColor(3);
+    } else {
+      bool has_text = g_PromptBuf[0] != '\0';
+      if (has_text) {
+        ImGui::PushStyleColor(ImGuiCol_Button, COL_ACCENT);
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.55f, 0.85f, 0.10f, 1.0f));
+        ImGui::PushStyleColor(ImGuiCol_Text, COL_BG);
+      } else {
+        ImGui::PushStyleColor(ImGuiCol_Button, COL_PANEL2);
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, COL_BORDER);
+        ImGui::PushStyleColor(ImGuiCol_Text, COL_MUTED);
+      }
+      if (ImGui::Button("##send", ImVec2(btn, btn)) || (enter && has_text)) {
+        if (has_text && !active_model.empty()) {
+          std::string final_prompt;
+          if (g_ModeThink)
+            final_prompt += "Think step by step before answering.\n\n";
+          if (g_ModeExt || g_RouteMode == 1)
+            final_prompt += "Provide a detailed and complete answer.\n\n";
+          final_prompt += "### Instruction:\n";
+          final_prompt += g_PromptBuf;
+          final_prompt += "\n\n### Response:\n";
+          athuex_worker_start(active_model.c_str(), final_prompt.c_str(),
+                              g_Threads, g_Ctx);
+          g_PromptBuf[0] = '\0';
+          set_status_message("");
+          set_keyboard_visible(false);
+        } else if (active_model.empty()) {
+          set_status_message("no model — open Settings");
+          g_ShowSettings = true;
+        } else if (!has_text) {
+          set_status_message("type a prompt");
+        }
+      }
+      if (has_text) {
+        ImVec2 p = ImGui::GetItemRectMin();
+        ImDrawList *dl = ImGui::GetWindowDrawList();
+        /* simple arrow glyph */
+        dl->AddText(ImVec2(p.x + 10, p.y + 7), ImGui::GetColorU32(COL_BG), "\xE2\x9E\xA1"); /* ➡ */
+      }
+      ImGui::PopStyleColor(3);
     }
+
+    ImGui::PopStyleVar(); /* FrameRounding */
+    ImGui::EndChild();
+    ImGui::PopStyleVar();
+    ImGui::PopStyleColor();
   }
 
   ImGui::End();
   ImGui::Render();
 #endif
+
 
   glViewport(0, 0, g_WindowWidth, g_WindowHeight);
   glClearColor(0.051f, 0.067f, 0.090f, 1.0f); /* #0d1117 */

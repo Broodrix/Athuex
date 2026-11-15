@@ -1,6 +1,6 @@
-/* Athuex SW v2.11.1 — network-first nav, never cache GGUF (Range/HEAD unsafe) */
+/* Athuex SW v2.11.6 — network-first nav, never cache GGUF (Range/HEAD unsafe) */
 'use strict';
-const CACHE = 'athuex-shell-v2.11.1';
+const CACHE = 'athuex-shell-v2.11.6';
 const SHELL = [
   './', './index.html', './css/ide.css',
   './js/version.js', './js/settings.js', './js/store.js', './js/vfs.js', './js/ai/local.js', './js/ai/llama_server.js', './js/ai/harness.js', './adapters/consciousness.js', './adapters/neuromorphic.js', './adapters/thermodynamic.js', './adapters/spatial_memory.js', './adapters/sia.js', './adapters/continuous_learning.js', './js/app/adapters_ui.js', './js/ai/router.js', './js/ai/cloud.js', './js/hybrid_traces.js', './js/markdown.js',

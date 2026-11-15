@@ -1,3 +1,15 @@
+## 2.11.6 (2026-11-15)
+
+- **Industry-standard Chat UI (native ImGui):**
+  - **Top toolbar (52px):** hamburger toggles history drawer, brand **Athuex**, live token speed / status, settings gear.
+  - **Message bubbles:** user right-aligned (`--panel2` + 3px accent green border); assistant left-aligned (`#1c2128` + 3px blue border); Copy / Retry action row on assistant messages.
+  - **Streaming cursor:** blinking green block while generation is active.
+  - **History drawer:** slide-over panel with New chat + session placeholder.
+  - **Settings popup:** model combo, Browse GGUF, Threads / Context sliders.
+  - **Liquid-glass chatbar:** auto-growing multiline input, Attach (+), AI Route pill (INT / EXT / HYB), Think toggle pill, circular mic, circular green Submit / red Stop.
+- Previous latency stack retained (3-frame wake, `eglSwapInterval(0)`, single-line MATCH_PARENT EditText, TextWatcher append fast-path, generation epoch, thread-safe input queue).
+- Version **2.11.6** / versionCode **2116**.
+
 ## 2.11.5 (2026-11-14)
 
 - **Keyboard latency (P08):** render-on-demand now schedules **3 frames** per wake so ImGui InputTextMultiline can settle cursor, scroll and WantTextInput without waiting for the next keystroke.
