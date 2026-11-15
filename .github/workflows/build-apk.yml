@@ -1,4 +1,5 @@
 # Athuex APK — GitHub Actions (arm64-v8a, Galaxy A06)
+# Included with every release zip from v2.11.6 onward.
 # Artifact: athuex-v<version-from-gradle>-debug.apk  (version auto-detected each run)
 #
 # History:
