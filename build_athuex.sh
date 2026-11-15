@@ -44,28 +44,18 @@ for pkg in git gh jq; do
 done
 
 # 4. Initialize repository and configure repository-local Git identity
-#    Shared storage can trigger Git's dubious-ownership check. Trust only this repo
-#    for commands in this script; never add a global safe.directory="*" wildcard.
-SAFE_GIT=(git -c "safe.directory=$(pwd)")
-
 if [ ! -d ".git" ]; then
-    if ! "${SAFE_GIT[@]}" init -b "$BRANCH" 2>/dev/null; then
-        # Older git without 'init -b' support
-        "${SAFE_GIT[@]}" init
-    fi
+    git init
 fi
-# Ensure the unborn branch is named as expected (no-op if already so).
-"${SAFE_GIT[@]}" branch -M "$BRANCH" 2>/dev/null || true
-
-if [ -z "$("${SAFE_GIT[@]}" config user.name || true)" ]; then
+if [ -z "$(git config user.name || true)" ]; then
     read -rp "Enter your Git Name: " git_name
-    "${SAFE_GIT[@]}" config user.name "$git_name"
+    git config user.name "$git_name"
 fi
-if [ -z "$("${SAFE_GIT[@]}" config user.email || true)" ]; then
+if [ -z "$(git config user.email || true)" ]; then
     read -rp "Enter your Git Email: " git_email
-    "${SAFE_GIT[@]}" config user.email "$git_email"
+    git config user.email "$git_email"
 fi
-"${SAFE_GIT[@]}" config core.autocrlf input
+git config core.autocrlf input
 
 # 5. Authenticate GitHub CLI with 'workflow' scope
 echo "[3/7] Checking GitHub authentication & 'workflow' scope..."
@@ -83,10 +73,14 @@ fi
 
 # 7. Prepare Git repository & point strictly to Broodrix/Athuex
 echo "[4/7] Preparing Git repository..."
+# Shared storage can trigger Git's dubious-ownership check. Trust only this repo
+# for commands in this script; never add a global safe.directory="*" wildcard.
+SAFE_GIT=(git -c "safe.directory=$(pwd)")
+"${SAFE_GIT[@]}" branch -M "$BRANCH"
 
 touch .gitignore
 for pattern in 'third_party/llama.cpp/' '*.gguf' '*.apk' 'build/' '.gradle/' 'android/.gradle/' 'android/app/build/'; do
-    grep -Fqx -- "$pattern" .gitignore || printf '%s\n' "$pattern" >> .gitignore
+    grep -Fqx -- "$pattern" .gitignore || printf '%s\\n' "$pattern" >> .gitignore
 done
 
 # Use GitHub CLI's configured credential helper. Never place the access token
@@ -102,33 +96,20 @@ case "$REMOTE_URL" in
         ;;
 esac
 
-"${SAFE_GIT[@]}" add -A .
-
-# ---- 8. Reconcile with remote history, then commit and push fast-forward ----
-echo "[5/7] Reconciling with ${REPO_SLUG} (${BRANCH}) and pushing..."
-
-# If the remote branch already exists, base our release commit on it so the
-# push is a fast-forward rather than a rejection. If the remote is empty or
-# unreachable, the fetch fails silently and we just create the root commit.
-if "${SAFE_GIT[@]}" fetch origin "$BRANCH" 2>/dev/null; then
-    REMOTE_HEAD=$("${SAFE_GIT[@]}" rev-parse --verify FETCH_HEAD 2>/dev/null || true)
-    if [ -n "${REMOTE_HEAD:-}" ]; then
-        echo "ℹ️  Remote ${BRANCH} already at ${REMOTE_HEAD:0:12}; rebasing release tree onto it."
-        # Keep index + worktree intact; only move HEAD/current branch pointer.
-        "${SAFE_GIT[@]}" reset --soft "$REMOTE_HEAD"
-    fi
-fi
-
+"${SAFE_GIT[@]}" add .
 if ! "${SAFE_GIT[@]}" diff --cached --quiet; then
     "${SAFE_GIT[@]}" commit -m "Release Athuex v${VERSION}"
 else
-    echo "ℹ️  Tree already identical to remote ${BRANCH}; no new commit."
+    echo "ℹ️  No new file changes to commit."
 fi
 
 COMMIT_SHA=$("${SAFE_GIT[@]}" rev-parse HEAD)
+
+echo "[5/7] Pushing updates to ${REPO_SLUG} (${BRANCH})..."
+# Normal push: fail on non-fast-forward instead of overwriting remote history.
 "${SAFE_GIT[@]}" push origin "HEAD:refs/heads/${BRANCH}"
 
-# 9. Check if push already triggered a build; if not, trigger manually
+# 8. Check if push already triggered a build; if not, trigger manually
 echo "[6/7] Checking GitHub Actions workflow (${WORKFLOW_FILE})..."
 sleep 6
 
@@ -158,6 +139,6 @@ gh run download "$RUN_ID" -R "$REPO_SLUG" -D "$DEST_DIR"
 
 echo "=================================================="
 echo "✅ APK ready at: $DEST_DIR"
-find "$DEST_DIR" -type f -name "*.apk" -exec ls -lh {} + 
+find "$DEST_DIR" -type f -name "*.apk" -exec ls -lh {} +
 echo "Tap the .apk file in your Android File Manager to install."
 echo "=================================================="

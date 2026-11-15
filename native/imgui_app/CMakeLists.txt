@@ -59,7 +59,7 @@ set(ATHUEX_NATIVE_SOURCES
 )
 
 if(ATHUEX_HAS_IMGUI AND EXISTS "${IMGUI_DIR}/imgui.cpp")
-  message(STATUS "Athuex: ImGui enabled (v2.11.7)")
+  message(STATUS "Athuex: ImGui enabled (v2.11.8)")
   list(APPEND ATHUEX_NATIVE_SOURCES
     ${IMGUI_DIR}/imgui.cpp
     ${IMGUI_DIR}/imgui_draw.cpp
@@ -68,10 +68,10 @@ if(ATHUEX_HAS_IMGUI AND EXISTS "${IMGUI_DIR}/imgui.cpp")
     ${IMGUI_DIR}/backends/imgui_impl_android.cpp
     ${IMGUI_DIR}/backends/imgui_impl_opengl3.cpp
   )
-  add_compile_definitions(ATHUEX_HAS_IMGUI=1 ATHUEX_VERSION=\"2.11.7\")
+  add_compile_definitions(ATHUEX_HAS_IMGUI=1 ATHUEX_VERSION=\"2.11.8\")
   add_compile_definitions(ATHUEX_NO_CURL=1)
 else()
-  add_compile_definitions(ATHUEX_VERSION=\"2.11.7\")
+  add_compile_definitions(ATHUEX_VERSION=\"2.11.8\")
 endif()
 
 # KV API auto-detect

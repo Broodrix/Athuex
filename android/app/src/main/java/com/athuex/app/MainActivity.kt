@@ -38,6 +38,8 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback {
     private var internalTextLock = false
     private var lastForwardedText = ""
     private lateinit var modelsDir: File
+    /** true = copy into app models dir; false = try use path in-place (Preserve Space) */
+    @Volatile private var modelImportMode: Boolean = false
 
     companion object {
         init {
@@ -71,17 +73,32 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback {
                 uri, Intent.FLAG_GRANT_READ_URI_PERMISSION
             )
         } catch (_: SecurityException) {
-            /* some providers do not support persistable grants — copy still works */
+            /* some providers do not support persistable grants */
         }
+        val importMode = modelImportMode
         Thread {
-            val dest = copyUriToModels(uri)
+            val path: String? = if (importMode) {
+                copyUriToModels(uri)?.absolutePath
+            } else {
+                // Preserve Space: try resolve real path without duplicating the file
+                resolveReadablePath(uri) ?: run {
+                    // Fallback: if we cannot get a stable path, still import once
+                    android.util.Log.w("Athuex", "Run mode: no direct path — importing once")
+                    copyUriToModels(uri)?.absolutePath
+                }
+            }
             runOnUiThread {
-                if (dest != null) {
-                    android.util.Log.i("Athuex", "GGUF picked → ${dest.absolutePath}")
-                    nativeOnModelPicked(dest.absolutePath)
-                    Toast.makeText(this, "Model ready: ${dest.name}", Toast.LENGTH_SHORT).show()
+                if (path != null) {
+                    android.util.Log.i("Athuex", "GGUF ready (${if (importMode) "import" else "run"}): $path")
+                    nativeOnModelPicked(path)
+                    val label = File(path).name
+                    Toast.makeText(
+                        this,
+                        if (importMode) "Imported: $label" else "Run (no copy): $label",
+                        Toast.LENGTH_SHORT
+                    ).show()
                 } else {
-                    Toast.makeText(this, "Failed to import GGUF", Toast.LENGTH_LONG).show()
+                    Toast.makeText(this, "Failed to open GGUF", Toast.LENGTH_LONG).show()
                 }
             }
         }.start()
@@ -274,7 +291,14 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback {
 
     /** Called from C++ when user taps Browse. */
     @Suppress("unused")
+    /** JNI zero-arg → Run (no copy / Preserve Space) */
     fun openGgufPicker() {
+        openGgufPicker(false)
+    }
+
+    /** @param importMode true = copy into app models/; false = Prefer path without copy */
+    fun openGgufPicker(importMode: Boolean) {
+        modelImportMode = importMode
         runOnUiThread {
             try {
                 pickGguf.launch(arrayOf("*/*", "application/octet-stream"))

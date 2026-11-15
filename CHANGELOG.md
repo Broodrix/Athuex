@@ -1,3 +1,12 @@
+## 2.11.8 (2026-11-16)
+
+- **Preserve Space (model load):** Settings → Local/GGUF offers **Run (no copy)** (default) vs **Import + Run**. Run resolves a readable path without duplicating the GGUF when the provider allows; Import always copies into the app models directory.
+- **Vector icons:** `native/shared/athuex_icons.h` — Menu, Settings, SendUp, Stop, Mic, Waveform, Attach, etc. drawn with ImDrawList (no emoji font / tofu boxes on Galaxy A06).
+- **App icon texture:** transparent PNG embedded via `athuex_icon_data.h` + stb_image; shown in toolbar and empty-chat hero.
+- **Mobile scroll:** fixed `MTechnoMobileScroll.hpp` — direct `win->Scroll.y`, deadzone without jump, InvisibleButton chips, zero per-frame string churn, `Reset()` on tab change.
+- **Multi-panel workspace:** Chat / Files / IDE / Live / Browser / Tools / Programs navbar; tabbed Settings (Local, Sampling, Cloud); drawer links to About + Adapters.
+- Version **2.11.8** / versionCode **2118**. Workflow included.
+
 ## 2.11.7 (2026-11-15)
 
 - **CI compile fix:** replace non-public `ImMin` with portable min expressions in drawer/settings layout (ImMin lives in imgui_internal.h and is not available with public imgui.h only).

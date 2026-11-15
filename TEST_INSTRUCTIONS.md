@@ -1,43 +1,25 @@
-# Athuex v2.11.7 — Test Instructions (Galaxy A06 + Termux / QuickEdit)
+# Athuex v2.11.8 — Test Instructions (Galaxy A06)
 
-## What this release adds (v2.11.7)
+## Preserve Space
+1. Settings → Local / GGUF → select **Run (no copy)** → Browse GGUF from Downloads.
+2. Expect toast `Run (no copy): <name>` when path resolves; otherwise a one-time import fallback.
+3. Switch to **Import + Run** → Browse again → file appears under app models/ and is selectable.
 
-1. **Toolbar (52px)**  
-   - Left: ☰ opens Chat History drawer; brand **Athuex**.  
-   - Right: live token speed (`X.X t/s · N tok`) while generating, or status / Ready; ⚙ opens Settings.
+## Icons
+1. Toolbar shows 3-line menu + Athuex logo texture + gear (vector) — no empty boxes.
+2. Chatbar: attach paperclip, mic, upward send arrow / stop square are vector-drawn.
 
-2. **Chat bubbles**  
-   - User: right-aligned, panel background, 3px green left border.  
-   - Assistant: left-aligned, darker bubble, 3px blue left border; Copy / Retry under finished replies.  
-   - Streaming: blinking green cursor at the end of the stream while the worker is active.
+## Scroll
+1. Generate a long reply (or paste history). Flick-scroll the chat; thumb appears on the right edge.
+2. Drag the thumb to scrub; release should settle without lag.
+3. Switch to IDE tab and back — scroll state resets cleanly.
 
-3. **Composer (liquid-glass)**  
-   - Auto-growing multiline (“Ask Anything”).  
-   - Left: **+** attach (placeholder status), **INT/EXT/HYB** route pill (cycles), **Think** pill.  
-   - Right: mic toggle, circular **Submit** (green arrow when text present) or **Stop** (red square during generation).
+## Panels
+1. Navbar: Chat / Files / IDE / Live / Browser / Tools / Programs.
+2. Files → select WELCOME.md opens IDE tab.
+3. Settings tabs: Local, Sampling, Cloud.
+4. Drawer: New chat, About, Adapters.
 
-4. **Settings popup**  
-   - Model dropdown (scanned GGUFs), Browse GGUF…, Threads (1–4), Context (1024–4096).
-
-5. **History drawer**  
-   - New chat clears stream + composer; session list is placeholder for a later phase.
-
-## Regression (must still pass from v2.11.5)
-
-0. **Typing stress**: type fast continuous characters; each char appears without waiting for the next key. 300–500 characters, backspace/retype, paste, emoji/accents — no dropped/duplicated characters, no long UI stall.
-1. Generation starts and streams tokens; Stop cancels.
-2. Model pick via Settings → Browse or dropdown after scan.
-3. No crash on surface destroy / activity pause.
-
-## Build
-
-```bash
-bash scripts/verify_tree.sh
-bash build_athuex.sh
-# Install the produced APK on Galaxy A06 and run the checks above.
-```
-
-## Notes
-
-- Attach file and full voice input are structured in the UI; backends land in a later phase.
-- Markdown / syntax-highlighted code blocks with copy-on-block remain simplified (plain text + bubble actions) until a lightweight markdown pass is added.
+## Regression
+- Fast typing still latency-free (v2.11.5 stack).
+- Stop cancels generation; token speed shows during stream.
