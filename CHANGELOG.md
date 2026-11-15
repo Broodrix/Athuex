@@ -1,3 +1,11 @@
+## 2.11.7 (2026-11-15)
+
+- **CI compile fix:** replace non-public `ImMin` with portable min expressions in drawer/settings layout (ImMin lives in imgui_internal.h and is not available with public imgui.h only).
+- **Warning cleanup:** remove unused `bg` variable in bubble draw path (`-Wextra` clean).
+- All v2.11.6 UI work retained (toolbar, bubbles, streaming cursor, liquid-glass composer, drawer, settings).
+- Version **2.11.7** / versionCode **2117**.
+- `.github/workflows/build-apk.yml` shipped in the zip.
+
 ## 2.11.6 (2026-11-15)
 
 - **Industry-standard Chat UI (native ImGui):**

@@ -1,6 +1,6 @@
-# Athuex v2.11.6 — Test Instructions (Galaxy A06 + Termux / QuickEdit)
+# Athuex v2.11.7 — Test Instructions (Galaxy A06 + Termux / QuickEdit)
 
-## What this release adds (v2.11.6)
+## What this release adds (v2.11.7)
 
 1. **Toolbar (52px)**  
    - Left: ☰ opens Chat History drawer; brand **Athuex**.  

@@ -1,4 +1,4 @@
-# Athuex v2.11.6 — build and verification
+# Athuex v2.11.7 — build and verification
 
 ## Environment
 
@@ -39,10 +39,10 @@ The local command above also needs the Android NDK sysroot's `android/log.h`; on
 ## CI / APK
 
 - GitHub Actions workflow: `.github/workflows/build-apk.yml`
-- Expected artifact: `athuex-v2.11.6-debug.apk`
+- Expected artifact: `athuex-v2.11.7-debug.apk`
 - ABI: `arm64-v8a`
-- versionName: `2.11.6`
-- versionCode: `2116`
+- versionName: `2.11.7`
+- versionCode: `2117`
 
 Build the APK in CI and install it on the device. This source ZIP is not itself an APK.
 
@@ -59,4 +59,4 @@ Build the APK in CI and install it on the device. This source ZIP is not itself 
 
 ## What is not claimed
 
-A clean APK build, zero runtime leaks, complete memory-safety proof, model-quality improvement, and Galaxy A06 runtime stability cannot be established by source inspection alone. The previous APK v2.11.0 build success and the supplied screenshot are accepted as user-reported baseline evidence, not as verification of v2.11.6.
+A clean APK build, zero runtime leaks, complete memory-safety proof, model-quality improvement, and Galaxy A06 runtime stability cannot be established by source inspection alone. The previous APK v2.11.0 build success and the supplied screenshot are accepted as user-reported baseline evidence, not as verification of v2.11.7.

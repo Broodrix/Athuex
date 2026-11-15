@@ -1,4 +1,4 @@
-# Testing v2116:
+# Testing v2117:
 
 Tested on a Samsung Galaxy A06. 
 
@@ -22,7 +22,7 @@ UI layout (toolbar, bubbles, composer pills) verified by source + structure. Key
 
 `https://github.com/Broodrix/Athuex/tree/master`
 
-## Athuex v2.11.6
+## Athuex v2.11.7
 
 Local-first AI APK (Galaxy A06).
 
@@ -30,7 +30,7 @@ Production UI: **Dear ImGui** (native, GLES3).
 P01: worker nice-10, mmap, OpenMP-off, cores left for UI.  
 P02: Clay + pure-C99 engine fully specified; migration path prepared.(DELAYED)
 
-**v2.11.6 highlights**
+**v2.11.7 highlights**
 - Industry-standard Chat UI: 52px toolbar (☰ + Athuex + t/s + ⚙), message bubbles with accent borders, streaming cursor, history drawer, settings popup, liquid-glass composer (INT/EXT/HYB route, Think, mic, circular Submit/Stop)
 - 3-frame render wake + `eglSwapInterval(0)` retained
 - Generation epoch + join-before-claim retained

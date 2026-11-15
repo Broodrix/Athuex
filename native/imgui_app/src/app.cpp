@@ -1,6 +1,6 @@
-/* Athuex native app — v2.11.6 pure-native ImGui
+/* Athuex native app — v2.11.7 pure-native ImGui
  * EGL + Dear ImGui (vendored), render-on-demand, JNI surface bridge.
- * v2.11.6: industry-standard Chat UI — 52px toolbar (hamburger+brand+
+ * v2.11.7: industry-standard Chat UI — 52px toolbar (hamburger+brand+
  *         metrics+gear), message bubbles with accent borders, streaming
  *         cursor, liquid-glass composer (route/think pills, circular
  *         submit/stop/mic), history drawer, settings popup.
@@ -433,7 +433,7 @@ static void render_frame() {
   /* ── History Drawer (overlay when open) ─────────────────────── */
   if (g_ShowDrawer) {
     ImGui::SetNextWindowPos(ImVec2(0, toolbar_h));
-    ImGui::SetNextWindowSize(ImVec2(ImMin(280.0f, (float)g_WindowWidth * 0.78f),
+    ImGui::SetNextWindowSize(ImVec2((280.0f < (float)g_WindowWidth * 0.78f ? 280.0f : (float)g_WindowWidth * 0.78f),
                                     (float)g_WindowHeight - toolbar_h));
     ImGui::PushStyleColor(ImGuiCol_WindowBg, COL_PANEL);
     ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0.0f);
@@ -462,7 +462,7 @@ static void render_frame() {
   if (g_ShowSettings) {
     ImGui::OpenPopup("Settings");
   }
-  ImGui::SetNextWindowSize(ImVec2(ImMin(340.0f, (float)g_WindowWidth - 24.0f), 0), ImGuiCond_Appearing);
+  ImGui::SetNextWindowSize(ImVec2((340.0f < (float)g_WindowWidth - 24.0f ? 340.0f : (float)g_WindowWidth - 24.0f), 0), ImGuiCond_Appearing);
   if (ImGui::BeginPopupModal("Settings", &g_ShowSettings,
                              ImGuiWindowFlags_AlwaysAutoResize)) {
     ImGui::TextColored(COL_ACCENT, "Engine");
@@ -553,7 +553,6 @@ static void render_frame() {
 
         ImVec2 p0 = ImGui::GetCursorScreenPos();
         ImDrawList *dl = ImGui::GetWindowDrawList();
-        ImU32 bg = ImGui::GetColorU32(is_user ? COL_PANEL2 : COL_AI_BG);
         ImU32 border = ImGui::GetColorU32(is_user ? COL_ACCENT : COL_BLUE);
 
         ImGui::PushStyleColor(ImGuiCol_ChildBg, is_user ? COL_PANEL2 : COL_AI_BG);
