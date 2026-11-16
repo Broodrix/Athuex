@@ -1,6 +1,6 @@
-/* Athuex native app — v2.11.8 pure-native ImGui
+/* Athuex native app — v2.11.9 pure-native ImGui
  * EGL + Dear ImGui (vendored), render-on-demand, JNI surface bridge.
- * v2.11.8: industry-standard Chat UI — 52px toolbar (hamburger+brand+
+ * v2.11.9: industry-standard Chat UI — 52px toolbar (hamburger+brand+
  *         metrics+gear), message bubbles with accent borders, streaming
  *         cursor, liquid-glass composer (route/think pills, circular
  *         submit/stop/mic), history drawer, settings popup.
@@ -114,7 +114,7 @@ static int         g_RouteMode = 0; /* 0=INT Local, 1=EXT External, 2=HYB Hybrid
 static bool        g_VoiceListening = false;
 static bool        g_ModeExt = false;
 
-/* v2.11.8 multi-panel workspace */
+/* v2.11.9 multi-panel workspace */
 enum AthuexTab {
   TAB_CHAT = 0, TAB_FILES, TAB_IDE, TAB_LIVE, TAB_BROWSER, TAB_TOOLS, TAB_PROGRAMS
 };
@@ -125,7 +125,7 @@ static int  g_SettingsTab     = 0; /* 0=Local/GGUF, 1=Sampling/TTC, 2=Cloud */
 static int  g_ModelLoadMode   = 0; /* 0=Run (no copy), 1=Import+Run */
 static int  g_FileVolume      = 0;
 static char g_IdeFileName[64] = "WELCOME.md";
-static char g_IdeBuffer[16384] = "# Welcome to Athuex\nMobile AI Workspace (v2.11.8)\n";
+static char g_IdeBuffer[16384] = "# Welcome to Athuex\nMobile AI Workspace (v2.11.9)\n";
 static char g_BrowserUrl[512] = "https://athuex.local";
 static char g_ConsoleLog[4096] = "[info] Athuex native workspace ready.\n";
 static float g_Temp = 0.4f;
@@ -630,7 +630,7 @@ static void render_frame() {
     ImGui::OpenPopup("About");
   }
   if (ImGui::BeginPopupModal("About", &g_ShowAbout, ImGuiWindowFlags_AlwaysAutoResize)) {
-    ImGui::TextColored(COL_ACCENT, "Athuex v2.11.8");
+    ImGui::TextColored(COL_ACCENT, "Athuex v2.11.9");
     ImGui::TextWrapped("Local-first Mobile AI Workspace for Galaxy A06.\nNative Dear ImGui · GLES3 · llama.cpp.");
     if (ImGui::Button("Close", ImVec2(-1, 0))) g_ShowAbout = false;
     ImGui::EndPopup();

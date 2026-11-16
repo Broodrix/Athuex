@@ -5,4 +5,4 @@ build/
 .gradle/
 android/.gradle/
 android/app/build/
-third_party/llama.cpp/\n
+third_party/llama.cpp/\nthird_party/llama.cpp/\n

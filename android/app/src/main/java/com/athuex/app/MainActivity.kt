@@ -23,7 +23,7 @@ import java.io.File
 import java.io.FileOutputStream
 
 /**
- * Athuex v2.11.5-native — OS bridge: SurfaceView, reliable IME, SAF GGUF picker, density.
+ * Athuex v2.11.9-native — OS bridge: SurfaceView, reliable IME, SAF GGUF picker, density.
  *
  * IME design (industry pattern used by mobile ImGui / game engines):
  * - Transparent (alpha=0) but VISIBLE EditText so the system IME attaches reliably.
@@ -334,6 +334,109 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback {
             android.util.Log.e("Athuex", "copyUriToModels", e)
             null
         }
+    }
+
+    /**
+     * Best-effort resolution of a content:// (or file://) URI to a real, readable
+     * filesystem path so large GGUF files do not need to be duplicated (Preserve Space).
+     * Returns null when no stable path is available; caller must fall back to copy.
+     *
+     * Strategy (industry-standard SAF path resolution):
+     *  1. file:// scheme → direct path
+     *  2. DocumentsContract primary/external storage tree → reconstruct /storage/... path
+     *  3. MediaStore / other providers → _data column when present and readable
+     *  4. Otherwise null (import path will be used)
+     */
+    private fun resolveReadablePath(uri: Uri): String? {
+        try {
+            // 1. Direct file scheme
+            if ("file".equals(uri.scheme, ignoreCase = true)) {
+                val path = uri.path
+                if (!path.isNullOrBlank()) {
+                    val f = File(path)
+                    if (f.isFile && f.canRead() && f.length() >= 1024) return f.absolutePath
+                }
+            }
+
+            // 2. DocumentsContract (Downloads, primary storage, SD card trees)
+            if (android.provider.DocumentsContract.isDocumentUri(this, uri)) {
+                val docId = android.provider.DocumentsContract.getDocumentId(uri)
+                val authority = uri.authority ?: ""
+
+                // ExternalStorageProvider: primary:Download/foo.gguf  or  XXXX-XXXX:path
+                if ("com.android.externalstorage.documents" == authority) {
+                    val split = docId.split(":", limit = 2)
+                    if (split.size == 2) {
+                        val type = split[0]
+                        val rel = split[1]
+                        val base = when {
+                            "primary".equals(type, ignoreCase = true) ->
+                                android.os.Environment.getExternalStorageDirectory()
+                            else -> {
+                                // Secondary volume (SD card) — common mount points
+                                val candidates = listOf(
+                                    File("/storage/$type"),
+                                    File("/mnt/media_rw/$type"),
+                                    File("/storage/sdcard1")
+                                )
+                                candidates.firstOrNull { it.exists() }
+                            }
+                        }
+                        if (base != null) {
+                            val candidate = File(base, rel)
+                            if (candidate.isFile && candidate.canRead() && candidate.length() >= 1024) {
+                                return candidate.absolutePath
+                            }
+                        }
+                    }
+                }
+
+                // DownloadsProvider: raw:/storage/emulated/0/Download/... or msf:123
+                if ("com.android.providers.downloads.documents" == authority) {
+                    if (docId.startsWith("raw:")) {
+                        val raw = docId.removePrefix("raw:")
+                        val f = File(raw)
+                        if (f.isFile && f.canRead() && f.length() >= 1024) return f.absolutePath
+                    }
+                    // Try content URI built from the numeric id (legacy)
+                    try {
+                        val id = android.content.ContentUris.parseId(uri)
+                        val dlUri = android.content.ContentUris.withAppendedId(
+                            Uri.parse("content://downloads/public_downloads"), id
+                        )
+                        contentResolver.query(dlUri, arrayOf("_data"), null, null, null)?.use { c ->
+                            if (c.moveToFirst()) {
+                                val idx = c.getColumnIndex("_data")
+                                if (idx >= 0) {
+                                    val data = c.getString(idx)
+                                    if (!data.isNullOrBlank()) {
+                                        val f = File(data)
+                                        if (f.isFile && f.canRead() && f.length() >= 1024) return f.absolutePath
+                                    }
+                                }
+                            }
+                        }
+                    } catch (_: Exception) { /* ignore */ }
+                }
+            }
+
+            // 3. Generic MediaStore / any provider that exposes _data
+            contentResolver.query(uri, arrayOf("_data"), null, null, null)?.use { c ->
+                if (c.moveToFirst()) {
+                    val idx = c.getColumnIndex("_data")
+                    if (idx >= 0) {
+                        val data = c.getString(idx)
+                        if (!data.isNullOrBlank()) {
+                            val f = File(data)
+                            if (f.isFile && f.canRead() && f.length() >= 1024) return f.absolutePath
+                        }
+                    }
+                }
+            }
+        } catch (e: Exception) {
+            android.util.Log.w("Athuex", "resolveReadablePath failed for $uri", e)
+        }
+        return null
     }
 
     override fun surfaceCreated(holder: SurfaceHolder) {

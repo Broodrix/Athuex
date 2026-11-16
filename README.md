@@ -1,8 +1,8 @@
-# Athuex v2.11.8
+# Athuex v2.11.9
 
 Local-first AI APK (Galaxy A06) — native Dear ImGui GLES3.
 
-**v2.11.8**
+**v2.11.9**
 - Preserve Space: Run (no copy) vs Import + Run for GGUF
 - Vector icons + embedded app icon texture
 - Fixed mobile scrollbars (MTechno)

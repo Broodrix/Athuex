@@ -1,3 +1,9 @@
+## 2.11.9 (2026-11-16)
+
+- **Build fix:** Implemented missing `resolveReadablePath(Uri)` in `MainActivity.kt` (was referenced but undefined → Kotlin compile failure). Full SAF path resolution for Preserve Space (file://, DocumentsContract primary/SD, Downloads raw, MediaStore `_data`).
+- **Version bump:** 2.11.9 / versionCode 2119. Workflow + all version strings updated.
+- Retains full 2.11.8 feature set (Preserve Space UI, vector icons, mobile scroll, multi-panel workspace).
+
 ## 2.11.8 (2026-11-16)
 
 - **Preserve Space (model load):** Settings → Local/GGUF offers **Run (no copy)** (default) vs **Import + Run**. Run resolves a readable path without duplicating the GGUF when the provider allows; Import always copies into the app models directory.
